@@ -1,869 +1,1066 @@
 """
-Adaptive Agentic RAG Framework
-================================
-Intelligently configures and optimizes the RAG pipeline based on knowledge base
-content analysis. Five cooperative agents replace the static default config:
+Agentic RAG Framework — LangGraph Edition
+==========================================
+A truly agentic RAG system built with LangGraph state machines.
 
-  Agent 1 – KBAnalyzerAgent   : Statistical + LLM-based KB profiling
-  Agent 2 – PlannerAgent      : Maps KB profile → optimal initial pipeline config
-  Agent 3 – IndexerAgent      : Builds vector index with the planned configuration
-  Agent 4 – OptimizerAgent    : Iteratively improves modules with KB-aware feedback
-  Agent 5 – QueryRouterAgent  : Routes each query at inference time for best results
+DESIGN PRINCIPLES
+-----------------
+Unlike the v2 sequential pipeline, this version has:
 
-Usage
------
-  python adaptive_rag.py
+  * Explicit, inspectable state (TypedDict) flowing through a graph
+  * LLM-driven conditional routing — at each decision point, an LLM picks the next node
+  * Reflection loops — critic nodes evaluate output and route back if quality is low
+  * Tool-based execution — operations are tools the orchestrator can choose to invoke
+  * Two composed graphs:
+      - SetupGraph  (build-time):  load → analyze → plan → index → optimize (with reflection)
+      - QueryGraph  (per-query):   classify → strategize → retrieve → critique → generate → reflect
+  * MemorySaver checkpointing — pause, inspect, resume any execution
 
-Expects:
-  ./knowledge_base/   – .txt and/or .pdf files
-  ./validation_queries.json  – [{"query": "...", "expected_answer": "..."}]
+WHY THIS IS "AGENTIC" AND THE OLD VERSION WASN'T
+------------------------------------------------
+The old pipeline always ran the same sequence regardless of input.
+This version's orchestrator LLM decides AT RUNTIME:
 
-Requirements (same as original):
-  pip install pypdf chromadb langchain-ollama langchain-community tqdm
-  Ollama running with: gemma4:latest  and  nomic-embed-text:latest
+  - Whether to expand the query with HyDE
+  - Whether multi-hop retrieval is needed (based on first-pass results)
+  - Whether to rerank (based on result quality)
+  - Whether the generated answer is good enough or should be retried
+  - Which optimizer module to tune next (based on metric deltas)
+
+Different queries take different paths through the graph.
+
+Requirements
+  pip install langgraph langchain-core langchain-ollama langchain-community \
+              chromadb pypdf python-docx sentence-transformers numpy tqdm
 """
 
-import os, json, time, copy, re, glob, statistics
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass, field
+from __future__ import annotations
+
+# ── stdlib ──────────────────────────────────────────────────────────────────
+import glob, json, os, re, statistics, time
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import Annotated, Any, Dict, List, Literal, Optional, Sequence, TypedDict
+
+# ── third-party ─────────────────────────────────────────────────────────────
+import numpy as np
 import pypdf
 import chromadb
-from langchain_ollama import OllamaEmbeddings
-from langchain_community.llms import Ollama
+from langchain_ollama import OllamaEmbeddings, ChatOllama
+from langchain_core.tools import tool
+from langchain_core.messages import (
+    BaseMessage, HumanMessage, AIMessage, SystemMessage, ToolMessage,
+)
+from langgraph.graph import StateGraph, START, END
+from langgraph.checkpoint.memory import MemorySaver
 from tqdm import tqdm
+
+try:
+    from sentence_transformers import CrossEncoder
+    _CROSS_ENCODER_AVAILABLE = True
+except ImportError:
+    _CROSS_ENCODER_AVAILABLE = False
+
+try:
+    import docx as python_docx
+    _DOCX_AVAILABLE = True
+except ImportError:
+    _DOCX_AVAILABLE = False
 
 
 # ======================== CONFIGURATION ========================
-KNOWLEDGE_BASE_PATH       = "./knowledge_base"
-VAL_QUERIES_PATH          = "./validation_queries.json"
-MAX_ITERATIONS_PER_MODULE = 3
-IMPROVEMENT_THRESHOLD     = 0.05      # 5 % improvement needed to accept a change
-LLM_MODEL                 = "gemma4:latest"
-EMBED_MODEL               = "nomic-embed-text:latest"
+KNOWLEDGE_BASE_PATH = "./knowledge_base"
+CHROMA_PERSIST_DIR  = "./chroma_store"
+VAL_QUERIES_PATH    = "./validation_queries.json"
 
-# How many documents / chars to feed the analyzer LLM
-KB_SAMPLE_DOCS  = 5
-KB_SAMPLE_CHARS = 2_000
+LLM_MODEL    = "gemma4:latest"        # tool-calling capable
+EMBED_MODEL  = "nomic-embed-text:latest"
+RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+COLLECTION_NAME = "agentic_rag_v3"
+
+MAX_OPTIMIZER_TURNS    = 6       # max orchestrator decisions in setup graph
+MAX_QUERY_RETRIES      = 2       # max reflective retries per query
+CONFIDENCE_THRESHOLD   = 0.65    # below this, the answer-critic forces a retry
+RETRIEVAL_THRESHOLD    = 0.50    # below this, the retrieval-critic triggers multihop
+
+CHUNK_SIZE_OPTIONS = [256, 512, 768, 1024]
+TOP_K_OPTIONS      = [3, 5, 7, 10]
 
 
-# ======================== KB PROFILE ========================
+# ============================================================
+# PART 1: SUPPORTING DATA STRUCTURES
+# ============================================================
 @dataclass
 class KBProfile:
-    """Rich description of the knowledge base, produced by KBAnalyzerAgent."""
+    doc_count:      int = 0
+    avg_doc_length: int = 0
+    domain:         str = "general"
+    structure_type: str = "mixed"
+    complexity:     str = "moderate"
+    has_code:       bool = False
+    has_tables:     bool = False
+    has_lists:      bool = False
+    languages:      List[str] = field(default_factory=lambda: ["english"])
 
-    # ── Document statistics ──────────────────────────────────────────────
-    doc_count:      int   = 0
-    total_chars:    int   = 0
-    avg_doc_length: int   = 0
-    max_doc_length: int   = 0
-    min_doc_length: int   = 0
-    std_doc_length: float = 0.0
-
-    # ── Content characteristics (LLM-detected) ──────────────────────────
-    domain:         str = "general"   # medical | legal | technical | financial | code | scientific | general
-    structure_type: str = "mixed"     # narrative | qa | reference | code | mixed
-    complexity:     str = "moderate"  # simple | moderate | complex
-
-    # ── Format flags (regex-detected) ───────────────────────────────────
-    content_types: List[str] = field(default_factory=lambda: ["text"])
-    languages:     List[str] = field(default_factory=lambda: ["english"])
-    has_code:   bool = False
-    has_tables: bool = False
-    has_lists:  bool = False
-
-    # ── Recommendations set by PlannerAgent ─────────────────────────────
-    recommended_chunk_strategy: str   = "fixed"
-    recommended_chunk_size:     int   = 512
-    recommended_chunk_overlap:  int   = 50
-    recommended_top_k:          int   = 5
-    recommended_temperature:    float = 0.7
+    def to_dict(self) -> Dict:
+        return asdict(self)
 
     def summary(self) -> str:
-        return (
-            f"Domain={self.domain}  Structure={self.structure_type}  "
-            f"Complexity={self.complexity}  Docs={self.doc_count}  "
-            f"AvgLen={self.avg_doc_length}ch  "
-            f"Code={self.has_code}  Tables={self.has_tables}"
-        )
+        return (f"domain={self.domain}, structure={self.structure_type}, "
+                f"complexity={self.complexity}, docs={self.doc_count}, "
+                f"avg_len={self.avg_doc_length}ch, code={self.has_code}")
 
 
-# ======================== AGENT 1 – KB ANALYZER ========================
-class KBAnalyzerAgent:
-    """
-    Produces a KBProfile from the raw document list.
-    Step 1 – Statistical analysis (fast, no LLM).
-    Step 2 – LLM classification of domain / structure / complexity.
-    """
+@dataclass
+class PipelineConfig:
+    chunk_strategy: str   = "paragraph"
+    chunk_size:     int   = 512
+    chunk_overlap:  int   = 64
+    top_k:          int   = 5
+    temperature:    float = 0.5
+    rerank_enabled: bool  = False
 
-    def __init__(self, llm_model: str = LLM_MODEL):
-        self.llm = Ollama(model=llm_model)
-
-    def analyze(self, documents: List[Dict]) -> KBProfile:
-        print("\n[KBAnalyzerAgent] Profiling knowledge base...")
-        profile = KBProfile()
-        if not documents:
-            print("  ⚠  No documents found.")
-            return profile
-
-        # ── 1a. Statistical metrics ───────────────────────────────────
-        lengths = [len(d["content"]) for d in documents]
-        profile.doc_count      = len(documents)
-        profile.total_chars    = sum(lengths)
-        profile.avg_doc_length = int(statistics.mean(lengths))
-        profile.max_doc_length = max(lengths)
-        profile.min_doc_length = min(lengths)
-        profile.std_doc_length = statistics.stdev(lengths) if len(lengths) > 1 else 0.0
-
-        # ── 1b. Regex-based content type detection ────────────────────
-        all_text = " ".join(d["content"] for d in documents)
-
-        code_patterns = [
-            r'\bdef \w+\(',         r'\bclass \w+[:\(]',
-            r'\bimport \w+',        r'\bfunction\s+\w+\s*\(',
-            r'\bvar \w+\s*=',       r'\bconst \w+\s*=',
-            r'\bif __name__\s*==',  r'```[\w]*\n',
-            r'\bpublic\s+\w+\s+\w+\s*\(',
-        ]
-        code_hits = sum(1 for p in code_patterns if re.search(p, all_text))
-        profile.has_code = code_hits >= 2
-        if profile.has_code:
-            profile.content_types.append("code")
-
-        table_patterns = [r'\|.+\|.+\|', r'\+[-+]+\+']
-        profile.has_tables = any(re.search(p, all_text, re.MULTILINE) for p in table_patterns)
-        if profile.has_tables:
-            profile.content_types.append("tables")
-
-        list_patterns = [r'^\s*[-•*]\s+\w+', r'^\s*\d+\.\s+\w+']
-        profile.has_lists = any(re.search(p, all_text, re.MULTILINE) for p in list_patterns)
-        if profile.has_lists:
-            profile.content_types.append("lists")
-
-        # ── 1c. LLM-based domain / structure / complexity detection ───
-        sample_text = "\n\n---\n\n".join(
-            f"[Doc {i+1}: {d['filename']}]\n{d['content'][:KB_SAMPLE_CHARS]}"
-            for i, d in enumerate(documents[:KB_SAMPLE_DOCS])
-        )
-        llm_data = self._llm_classify(sample_text)
-        profile.domain         = llm_data.get("domain",         "general")
-        profile.structure_type = llm_data.get("structure_type", "mixed")
-        profile.complexity     = llm_data.get("complexity",     "moderate")
-        if "languages" in llm_data:
-            profile.languages = llm_data["languages"]
-
-        print(f"  ✓ {profile.summary()}")
-        return profile
-
-    def _llm_classify(self, sample_text: str) -> Dict:
-        prompt = f"""Analyze these document samples and return ONLY a JSON object.
-
-SAMPLES:
-{sample_text}
-
-Return exactly:
-{{
-  "domain": "<medical|legal|technical|financial|code|scientific|historical|general>",
-  "structure_type": "<narrative|qa|reference|code|mixed>",
-  "complexity": "<simple|moderate|complex>",
-  "languages": ["<language>"]
-}}
-
-No explanation, only JSON."""
-        try:
-            response = self.llm.invoke(prompt).strip()
-            m = re.search(r'\{.*\}', response, re.DOTALL)
-            if m:
-                return json.loads(m.group())
-        except Exception as e:
-            print(f"  ⚠  LLM classification failed ({e}); using defaults.")
-        return {}
+    def to_dict(self) -> Dict:
+        return asdict(self)
 
 
-# ======================== AGENT 2 – PLANNER ========================
-class PlannerAgent:
-    """
-    Converts a KBProfile into an optimal initial pipeline configuration.
-    Uses fast heuristics as a base, then refines with LLM reasoning.
-    """
-
-    def __init__(self, llm_model: str = LLM_MODEL):
-        self.llm = Ollama(model=llm_model)
-
-    def plan(self, profile: KBProfile) -> Dict[str, Any]:
-        print("\n[PlannerAgent] Designing initial pipeline configuration...")
-
-        config = self._heuristic_plan(profile)
-        config = self._llm_refine(profile, config)
-
-        # Write recommendations back to profile for downstream agents
-        profile.recommended_chunk_strategy = config.get("chunk_strategy", "fixed")
-        profile.recommended_chunk_size      = config["chunking"]["size"]
-        profile.recommended_chunk_overlap   = config["chunking"]["overlap"]
-        profile.recommended_top_k           = config["retrieval"]["top_k"]
-        profile.recommended_temperature     = config["generation"]["temperature"]
-
-        print(f"  ✓ Chunk strategy : {profile.recommended_chunk_strategy}")
-        print(f"  ✓ Chunk size/ovlp: {profile.recommended_chunk_size} / {profile.recommended_chunk_overlap}")
-        print(f"  ✓ Top-K          : {profile.recommended_top_k}")
-        print(f"  ✓ Temperature    : {profile.recommended_temperature}")
-        return config
-
-    # ── Heuristic rules ──────────────────────────────────────────────────
-    def _heuristic_plan(self, p: KBProfile) -> Dict:
-        cfg = {
-            "chunk_strategy": "fixed",
-            "chunking":  {"type": "chunking",  "size": 512, "overlap": 50},
-            "embedding": {"type": "embedding", "model": EMBED_MODEL, "batch_size": 50},
-            "retrieval": {"type": "retrieval", "top_k": 5,  "similarity": "cosine"},
-            "reranking": {"type": "reranking", "enabled": False, "model": None},
-            "generation":{"type": "generation","temperature": 0.7, "max_tokens": 256, "llm": LLM_MODEL},
-        }
-
-        # Chunk size from avg document length
-        if p.avg_doc_length < 500:
-            cfg["chunking"].update(size=200, overlap=20)
-            cfg["chunk_strategy"] = "sentence"
-        elif p.avg_doc_length < 2_000:
-            cfg["chunking"].update(size=400, overlap=40)
-            cfg["chunk_strategy"] = "paragraph" if p.structure_type == "narrative" else "fixed"
-        elif p.avg_doc_length < 8_000:
-            cfg["chunking"].update(size=700, overlap=90)
-            cfg["chunk_strategy"] = "paragraph"
-        else:
-            cfg["chunking"].update(size=1024, overlap=128)
-            cfg["chunk_strategy"] = "paragraph"
-
-        # Code documents get their own splitter
-        if p.has_code or p.domain == "code":
-            cfg["chunking"].update(size=800, overlap=100)
-            cfg["chunk_strategy"] = "code"
-            cfg["retrieval"]["top_k"] = 7
-
-        # High-precision domains → more context + reranking + conservative generation
-        if p.domain in ("medical", "legal", "scientific"):
-            cfg["retrieval"]["top_k"] = 8
-            cfg["reranking"]["enabled"] = True
-            cfg["generation"].update(temperature=0.3, max_tokens=400)
-        elif p.domain == "financial":
-            cfg["retrieval"]["top_k"] = 6
-            cfg["generation"]["temperature"] = 0.4
-
-        # Complexity adjustments
-        if p.complexity == "complex":
-            cfg["retrieval"]["top_k"] = min(cfg["retrieval"]["top_k"] + 2, 12)
-            cfg["generation"]["max_tokens"] = 512
-            cfg["generation"]["temperature"] = max(cfg["generation"]["temperature"] - 0.1, 0.1)
-        elif p.complexity == "simple":
-            cfg["retrieval"]["top_k"] = max(cfg["retrieval"]["top_k"] - 2, 3)
-            cfg["generation"]["max_tokens"] = 200
-
-        # Structure-type tweaks
-        if p.structure_type == "qa":
-            cfg["chunking"]["size"] = max(cfg["chunking"]["size"] - 100, 200)
-            cfg["chunk_strategy"] = "paragraph"
-        elif p.structure_type == "reference":
-            cfg["retrieval"]["top_k"] += 1
-
-        return cfg
-
-    # ── LLM refinement of heuristics ────────────────────────────────────
-    def _llm_refine(self, profile: KBProfile, heuristic_config: Dict) -> Dict:
-        prompt = f"""You are a RAG systems expert. Refine this initial pipeline config for the knowledge base described.
-
-KB PROFILE:
-  Domain         : {profile.domain}
-  Structure      : {profile.structure_type}
-  Complexity     : {profile.complexity}
-  Avg doc length : {profile.avg_doc_length} chars  (max={profile.max_doc_length})
-  Has code       : {profile.has_code}
-  Has tables     : {profile.has_tables}
-  Doc count      : {profile.doc_count}
-
-HEURISTIC CONFIG (improve it):
-{json.dumps(heuristic_config, indent=2)}
-
-Consider:
-- Are chunk size and overlap right for this domain?
-- Is top_k appropriate for the number of docs and complexity?
-- Is temperature correct (lower for factual domains, higher for creative)?
-- Which chunk_strategy is best: "fixed", "sentence", "paragraph", or "code"?
-
-Return ONLY a JSON object with the same top-level keys, values improved where needed."""
-        try:
-            response = self.llm.invoke(prompt).strip()
-            m = re.search(r'\{.*\}', response, re.DOTALL)
-            if m:
-                refined = json.loads(m.group())
-                # Safely merge: only overwrite sub-dicts that exist in both
-                for key in heuristic_config:
-                    if key in refined:
-                        if isinstance(refined[key], dict) and isinstance(heuristic_config[key], dict):
-                            heuristic_config[key].update(refined[key])
-                        elif type(refined[key]) == type(heuristic_config[key]):
-                            heuristic_config[key] = refined[key]
-        except Exception as e:
-            print(f"  ⚠  LLM refinement failed ({e}); keeping heuristics.")
-        return heuristic_config
-
-
-# ======================== CONTENT-AWARE CHUNKER ========================
+# ============================================================
+# PART 2: CORE COMPONENTS (slimmed from v2, unchanged in spirit)
+# ============================================================
 class ContentAwareChunker:
-    """
-    Selects the best splitting strategy based on content type:
-      fixed     – character window (original behaviour)
-      sentence  – split on sentence boundaries, merge up to target size
-      paragraph – split on blank lines, merge small paragraphs
-      code      – split on top-level def/class/function declarations
-    """
-
-    def __init__(self, config: Dict, strategy: str = "fixed"):
-        self.size     = config.get("size", 512)
-        self.overlap  = config.get("overlap", 50)
-        self.strategy = strategy
+    def __init__(self, strategy: str = "paragraph", size: int = 512, overlap: int = 64):
+        self.strategy, self.size, self.overlap = strategy, size, overlap
 
     def chunk(self, text: str) -> List[str]:
-        dispatch = {
-            "sentence":  self._sentence_chunk,
-            "paragraph": self._paragraph_chunk,
-            "code":      self._code_chunk,
-        }
-        return dispatch.get(self.strategy, self._fixed_chunk)(text)
+        return {
+            "sentence":  self._sentence, "paragraph": self._paragraph,
+            "code":      self._code,
+        }.get(self.strategy, self._fixed)(text)
 
-    def _fixed_chunk(self, text: str) -> List[str]:
-        chunks, start = [], 0
+    def _fixed(self, text):
+        out, start = [], 0
         while start < len(text):
-            chunks.append(text[start : start + self.size])
+            out.append(text[start:start + self.size])
             start += self.size - self.overlap
-        return [c for c in chunks if c.strip()]
+        return [c for c in out if c.strip()]
 
-    def _sentence_chunk(self, text: str) -> List[str]:
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        chunks, current = [], ""
-        for sent in sentences:
-            if current and len(current) + len(sent) > self.size:
-                chunks.append(current.strip())
-                current = current[-self.overlap:] + " " + sent if self.overlap else sent
+    def _sentence(self, text):
+        sents = re.split(r'(?<=[.!?])\s+', text)
+        out, cur = [], ""
+        for s in sents:
+            if cur and len(cur) + len(s) > self.size:
+                out.append(cur.strip())
+                cur = (cur[-self.overlap:] + " " + s) if self.overlap else s
             else:
-                current += (" " if current else "") + sent
-        if current.strip():
-            chunks.append(current.strip())
-        return chunks
+                cur += (" " if cur else "") + s
+        if cur.strip(): out.append(cur.strip())
+        return out
 
-    def _paragraph_chunk(self, text: str) -> List[str]:
+    def _paragraph(self, text):
         paras = [p.strip() for p in re.split(r'\n\s*\n', text) if p.strip()]
-        chunks, current = [], ""
-        for para in paras:
-            if current and len(current) + len(para) > self.size:
-                chunks.append(current)
-                current = para
+        out, cur = [], ""
+        for p in paras:
+            if cur and len(cur) + len(p) > self.size:
+                out.append(cur); cur = p
             else:
-                current += ("\n\n" if current else "") + para
-        if current:
-            chunks.append(current)
-        # Oversized paragraphs → fallback fixed-split
-        final = []
-        for c in chunks:
-            final.extend(self._fixed_chunk(c) if len(c) > self.size * 1.5 else [c])
-        return final
+                cur += ("\n\n" if cur else "") + p
+        if cur: out.append(cur)
+        result = []
+        for c in out:
+            result.extend(self._fixed(c) if len(c) > self.size * 1.5 else [c])
+        return result
 
-    def _code_chunk(self, text: str) -> List[str]:
-        boundaries = list(re.finditer(
-            r'^(?:def |class |function |public |private |protected )',
-            text, re.MULTILINE
-        ))
-        if len(boundaries) < 2:
-            return self._paragraph_chunk(text)
+    def _code(self, text):
+        bounds = list(re.finditer(r'^(?:def |class |function |public )', text, re.MULTILINE))
+        if len(bounds) < 2: return self._paragraph(text)
         chunks = []
-        for i, match in enumerate(boundaries):
-            start = match.start()
-            end   = boundaries[i + 1].start() if i + 1 < len(boundaries) else len(text)
-            block = text[start:end].strip()
-            chunks.extend(self._fixed_chunk(block) if len(block) > self.size * 2 else [block])
+        for i, m in enumerate(bounds):
+            end = bounds[i + 1].start() if i + 1 < len(bounds) else len(text)
+            block = text[m.start():end].strip()
+            chunks.extend(self._fixed(block) if len(block) > self.size * 2 else [block])
         return [c for c in chunks if c]
 
 
-# ======================== CORE COMPONENTS ========================
 class Embedder:
-    def __init__(self, config: Dict):
-        self.model_name = config.get("model", EMBED_MODEL)
-        self.batch_size = config.get("batch_size", 50)
-        self.embeddings = OllamaEmbeddings(model=self.model_name)
+    def __init__(self, model: str = EMBED_MODEL, batch_size: int = 50):
+        self.model = OllamaEmbeddings(model=model)
+        self.batch_size = batch_size
 
     def embed(self, texts: List[str]) -> List[List[float]]:
-        all_embeds = []
-        for i in tqdm(range(0, len(texts), self.batch_size), desc=f"Embedding ({self.model_name})"):
-            all_embeds.extend(self.embeddings.embed_documents(texts[i : i + self.batch_size]))
-        return all_embeds
+        out = []
+        for i in range(0, len(texts), self.batch_size):
+            out.extend(self.model.embed_documents(texts[i:i + self.batch_size]))
+        return out
+
+    def cosine(self, a, b) -> float:
+        a, b = np.array(a), np.array(b)
+        d = np.linalg.norm(a) * np.linalg.norm(b)
+        return float(np.dot(a, b) / d) if d > 1e-9 else 0.0
 
 
 class Retriever:
-    def __init__(self, config: Dict, embedder: Embedder):
-        self.top_k      = config.get("top_k", 5)
-        self.embedder   = embedder
-        self._client    = chromadb.Client()
-        # Unique collection name prevents key conflicts on re-indexing
-        self._coll_name = f"rag_{int(time.time() * 1000)}"
-        self.collection = self._client.get_or_create_collection(self._coll_name)
+    def __init__(self, embedder: Embedder, persist_dir: str = CHROMA_PERSIST_DIR):
+        self.embedder = embedder
+        self._client = chromadb.PersistentClient(path=persist_dir)
+        self.collection = self._client.get_or_create_collection(COLLECTION_NAME)
 
-    def index(self, chunks: List[str], metadatas: List[Dict] = None):
-        ids        = [f"chunk_{i}" for i in range(len(chunks))]
-        embeddings = self.embedder.embed(chunks)
-        self.collection.add(
-            embeddings=embeddings,
-            documents=chunks,
-            metadatas=metadatas or [{}] * len(chunks),
-            ids=ids,
-        )
+    @property
+    def count(self) -> int:
+        return self.collection.count()
 
-    def retrieve(self, query: str, top_k: Optional[int] = None) -> List[str]:
-        k     = top_k or self.top_k
+    def clear(self):
+        name = self.collection.name
+        self._client.delete_collection(name)
+        self.collection = self._client.get_or_create_collection(name)
+
+    def index(self, chunks: List[str], metadatas: List[Dict]):
+        ids = [f"chunk_{i}_{int(time.time()*1000)}" for i in range(len(chunks))]
+        embs = []
+        for i in tqdm(range(0, len(chunks), self.embedder.batch_size), desc="Embedding"):
+            embs.extend(self.embedder.embed(chunks[i:i + self.embedder.batch_size]))
+        self.collection.add(embeddings=embs, documents=chunks,
+                            metadatas=metadatas, ids=ids)
+
+    def retrieve(self, query: str, top_k: int = 5,
+                 where: Optional[Dict] = None) -> List[str]:
         q_emb = self.embedder.embed([query])[0]
-        res   = self.collection.query(q_emb, n_results=k)
+        kwargs = {"n_results": top_k}
+        if where: kwargs["where"] = where
+        res = self.collection.query(q_emb, **kwargs)
         return res["documents"][0] if res["documents"] else []
 
 
 class Reranker:
-    def __init__(self, config: Dict):
-        self.enabled = config.get("enabled", False)
+    def __init__(self, model_name: str = RERANKER_MODEL):
+        self._model = None
+        if _CROSS_ENCODER_AVAILABLE:
+            try:
+                self._model = CrossEncoder(model_name)
+            except Exception as e:
+                print(f"  ⚠  Reranker init failed: {e}")
 
     def rerank(self, query: str, docs: List[str]) -> List[str]:
-        # Placeholder: replace with a cross-encoder (e.g., sentence-transformers)
-        return docs
+        if not docs or self._model is None:
+            return sorted(docs, key=len, reverse=True) if docs else docs
+        pairs = [[query, d] for d in docs]
+        scores = self._model.predict(pairs)
+        return [d for _, d in sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)]
 
 
-class Generator:
-    def __init__(self, config: Dict):
-        self.llm         = Ollama(model=config.get("llm", LLM_MODEL))
-        self.temperature = config.get("temperature", 0.7)
-        self.max_tokens  = config.get("max_tokens", 256)
-
-    def generate(self, query: str, context: List[str], query_type: str = "factual") -> str:
-        if not context:
-            return "I don't know."
-
-        instructions = {
-            "factual":       "Answer based only on context. If unsure, say 'I don't know'.",
-            "analytical":    "Analyze the context thoroughly and provide a detailed response.",
-            "code":          "Answer the technical question using code examples from the context.",
-            "comparison":    "Compare and contrast using only the provided context.",
-            "summarization": "Summarize the key points from the provided context.",
-        }
-        instruction = instructions.get(query_type, instructions["factual"])
-
-        prompt = f"""{instruction}
-
-Context:
-{chr(10).join(f'[{i+1}] {c}' for i, c in enumerate(context))}
-
-Question: {query}
-
-Answer:"""
-        return self.llm.invoke(prompt, temperature=self.temperature).strip()
-
-
-# ======================== AGENT 5 – QUERY ROUTER ========================
-class QueryRouterAgent:
+# ============================================================
+# PART 3: GLOBAL RUNTIME — components shared across graph nodes
+# ============================================================
+class Runtime:
     """
-    Classifies each incoming query and returns tuned retrieval parameters.
-    Uses fast regex heuristics first; falls back to LLM for ambiguous queries.
+    Singleton holding the stateful components nodes need to call.
+    LangGraph state is for control flow + serializable payloads,
+    not heavy objects like ChromaDB clients or models.
     """
-
-    TYPES = {"factual", "analytical", "code", "comparison", "summarization"}
-
-    def __init__(self, profile: KBProfile, llm_model: str = LLM_MODEL):
-        self.profile = profile
-        self.llm     = Ollama(model=llm_model)
-        self._cache: Dict[str, str] = {}
-
-    def classify(self, query: str) -> str:
-        if query in self._cache:
-            return self._cache[query]
-
-        q = query.lower()
-        if any(w in q for w in ["compare", "difference", "vs ", "versus", "contrast"]):
-            qt = "comparison"
-        elif any(w in q for w in ["how to", "implement", "code for", "function", "debug", "syntax"]):
-            qt = "code"
-        elif any(w in q for w in ["why", "analyze", "implications", "what causes", "explain"]):
-            qt = "analytical"
-        elif any(w in q for w in ["summarize", "summary", "overview", "briefly", "tldr"]):
-            qt = "summarization"
-        else:
-            # LLM fallback
-            try:
-                prompt = (
-                    f'Classify this query into ONE of: factual, analytical, code, comparison, summarization\n'
-                    f'Query: "{query}"\nReturn only one word.'
-                )
-                result = self.llm.invoke(prompt).strip().lower()
-                qt = result if result in self.TYPES else "factual"
-            except Exception:
-                qt = "factual"
-
-        self._cache[query] = qt
-        return qt
-
-    def get_retrieval_params(self, query_type: str) -> Dict:
-        base_k = self.profile.recommended_top_k
-        table  = {
-            "factual":       {"top_k": base_k,              "rerank": False},
-            "analytical":    {"top_k": base_k + 3,          "rerank": True},
-            "code":          {"top_k": base_k + 2,          "rerank": False},
-            "comparison":    {"top_k": base_k + 4,          "rerank": True},
-            "summarization": {"top_k": min(base_k + 5, 15), "rerank": False},
-        }
-        return table.get(query_type, table["factual"])
+    embedder:  Embedder
+    retriever: Retriever
+    reranker:  Reranker
+    llm:       ChatOllama          # for tool/decision LLM calls
+    answer_llm:ChatOllama          # for the final answer generation
+    profile:   Optional[KBProfile] = None
+    config:    PipelineConfig      = PipelineConfig()
+    documents: List[Dict]          = []
 
 
-# ======================== ADAPTIVE RAG PIPELINE ========================
-class AdaptiveRAGPipeline:
-    """
-    Full adaptive pipeline. Combines content-aware chunking with
-    query-time routing for best-in-class retrieval and generation.
-    """
-
-    def __init__(self, modules: Dict[str, Any], profile: KBProfile):
-        self.modules = modules
-        self.profile = profile
-
-        strategy        = modules.get("chunk_strategy", profile.recommended_chunk_strategy)
-        self.chunker    = ContentAwareChunker(modules["chunking"], strategy)
-        self.embedder   = Embedder(modules["embedding"])
-        self.retriever  = Retriever(modules["retrieval"], self.embedder)
-        self.reranker   = Reranker(modules["reranking"])
-        self.generator  = Generator(modules["generation"])
-        self.router     = QueryRouterAgent(profile)
-        self.is_indexed = False
-
-    # ── Indexer (Agent 3) ────────────────────────────────────────────────
-    def index_documents(self, documents: List[Dict]):
-        print("\n[IndexerAgent] Chunking and indexing documents...")
-        all_chunks, metadata = [], []
-        for doc in tqdm(documents, desc="Chunking"):
-            chunks = self.chunker.chunk(doc["content"])
-            all_chunks.extend(chunks)
-            metadata.extend([{"source": doc["filename"]}] * len(chunks))
-        print(f"  ✓ {len(all_chunks)} chunks from {len(documents)} document(s)")
-        self.retriever.index(all_chunks, metadata)
-        self.is_indexed = True
-
-    # ── Inference with routing ───────────────────────────────────────────
-    def answer(self, query: str, verbose: bool = False) -> str:
-        if not self.is_indexed:
-            raise RuntimeError("Pipeline not indexed. Call index_documents() first.")
-
-        query_type = self.router.classify(query)
-        params     = self.router.get_retrieval_params(query_type)
-
-        if verbose:
-            print(f"  [Router] type={query_type}  top_k={params['top_k']}")
-
-        docs = self.retriever.retrieve(query, top_k=params["top_k"])
-        if params["rerank"] and self.reranker.enabled:
-            docs = self.reranker.rerank(query, docs)
-
-        return self.generator.generate(query, docs, query_type)
-
-    # ── Hot-swap any module ──────────────────────────────────────────────
-    def update_module(self, module_type: str, new_config: Dict):
-        self.modules[module_type] = new_config
-        if module_type == "chunking":
-            strategy        = self.modules.get("chunk_strategy", self.profile.recommended_chunk_strategy)
-            self.chunker    = ContentAwareChunker(new_config, strategy)
-        elif module_type == "embedding":
-            self.embedder   = Embedder(new_config)
-            self.retriever  = Retriever(self.modules["retrieval"], self.embedder)
-            self.is_indexed = False
-        elif module_type == "retrieval":
-            self.retriever  = Retriever(new_config, self.embedder)
-            self.is_indexed = False
-        elif module_type == "reranking":
-            self.reranker   = Reranker(new_config)
-        elif module_type == "generation":
-            self.generator  = Generator(new_config)
+RT = Runtime()   # populated by setup graph
 
 
-# ======================== EVALUATION ========================
-@dataclass
-class Metrics:
-    answer_accuracy:    float = 0.0
-    retrieval_precision:float = 0.0
-    retrieval_recall:   float = 0.0
-    latency_ms:         float = 0.0
-    overall_score:      float = 0.0
+# ============================================================
+# PART 4: TOOLS — atomic operations the agents can invoke
+# ============================================================
+# Tools accept simple types and return simple types so the LLM can
+# reason about them as discrete actions.
+
+@tool
+def retrieve_documents(query: str, top_k: int = 5,
+                       source_filter: Optional[str] = None) -> List[str]:
+    """Retrieve the top_k most relevant chunks from the vector store. Optionally filter by source filename."""
+    where = {"source": source_filter} if source_filter else None
+    return RT.retriever.retrieve(query, top_k=top_k, where=where)
 
 
-class Evaluator:
-    def __init__(self, val_queries: List[Dict], baseline_pipeline: AdaptiveRAGPipeline):
-        self.val_queries      = val_queries
-        self.baseline_metrics = (
-            self.evaluate(baseline_pipeline) if baseline_pipeline.is_indexed else Metrics()
-        )
-
-    def evaluate(self, pipeline: AdaptiveRAGPipeline) -> Metrics:
-        acc, prec, rec, lat = 0.0, 0.0, 0.0, 0.0
-        for item in tqdm(self.val_queries, desc="Evaluating"):
-            query    = item["query"]
-            expected = item["expected_answer"].lower()
-            t0       = time.time()
-            answer   = pipeline.answer(query).lower()
-            lat     += (time.time() - t0) * 1000
-            acc     += 1.0 if expected in answer or answer in expected else 0.0
-            if "relevant_chunks" in item:
-                retrieved = pipeline.retriever.retrieve(query)
-                rel = set(item["relevant_chunks"])
-                ret = set(retrieved)
-                tp  = len(rel & ret)
-                prec += tp / max(len(ret), 1)
-                rec  += tp / max(len(rel), 1)
-        n = max(len(self.val_queries), 1)
-        m = Metrics(
-            answer_accuracy=acc / n,
-            retrieval_precision=prec / n,
-            retrieval_recall=rec / n,
-            latency_ms=lat / n,
-        )
-        f1 = (2 * m.retrieval_precision * m.retrieval_recall /
-              max(m.retrieval_precision + m.retrieval_recall, 1e-9))
-        m.overall_score = 0.7 * m.answer_accuracy + 0.3 * f1
-        return m
-
-    def is_improvement(self, new_metrics: Metrics) -> bool:
-        return (new_metrics.overall_score - self.baseline_metrics.overall_score) >= IMPROVEMENT_THRESHOLD
+@tool
+def rerank_documents(query: str, docs: List[str]) -> List[str]:
+    """Rerank documents using a cross-encoder for higher precision. Returns docs reordered by relevance."""
+    return RT.reranker.rerank(query, docs)
 
 
-# ======================== AGENT 4 – OPTIMIZER ========================
-class KBAwareLLMModuleGenerator:
-    """
-    Generates improved module configs using KB profile as context.
-    More targeted than the original generic generator.
-    """
+@tool
+def expand_query_hyde(query: str) -> str:
+    """Generate a hypothetical answer (HyDE) to use as an additional retrieval query."""
+    domain = RT.profile.domain if RT.profile else "general"
+    prompt = (
+        f"Write one short paragraph that directly answers this question as if "
+        f"it appeared in a {domain} document.\n\nQuestion: {query}\n\nParagraph:"
+    )
+    resp = RT.answer_llm.invoke(prompt)
+    return resp.content.strip()
 
-    def __init__(self, profile: KBProfile, llm_model: str = LLM_MODEL):
-        self.profile = profile
-        self.llm     = Ollama(model=llm_model)
 
-    def generate_config(self, module_type: str, current_config: Dict,
-                        feedback: Optional[str] = None) -> Dict:
-        prompt = f"""You are optimizing a RAG system for a {self.profile.domain} knowledge base.
+@tool
+def generate_answer(query: str, context: List[str], style: str = "factual") -> str:
+    """Generate the final answer from the query and retrieved context. Style: factual|analytical|code|comparison|summarization."""
+    if not context:
+        return "I don't have enough information to answer that."
 
-KB CONTEXT:
-  Domain={self.profile.domain}  Structure={self.profile.structure_type}
-  Complexity={self.profile.complexity}  AvgDocLen={self.profile.avg_doc_length}ch
-  HasCode={self.profile.has_code}  HasTables={self.profile.has_tables}
+    instructions = {
+        "factual":       "Answer based only on the context. If unsure, say 'I don't know'.",
+        "analytical":    "Analyze the context thoroughly and provide a detailed response.",
+        "code":          "Answer the technical question with code examples from the context.",
+        "comparison":    "Compare and contrast using only the provided context.",
+        "summarization": "Summarize the key points from the provided context.",
+    }
+    ctx = "\n".join(f"[{i+1}] {c}" for i, c in enumerate(context))
+    prompt = (
+        f"{instructions.get(style, instructions['factual'])}\n\n"
+        f"Context:\n{ctx}\n\nQuestion: {query}\n\nAnswer:"
+    )
+    return RT.answer_llm.invoke(prompt).content.strip()
 
-OPTIMIZING: {module_type}
-Current config: {json.dumps(current_config, indent=2)}
-{"Feedback from last attempt: " + feedback if feedback else "Goal: improve retrieval quality and answer accuracy."}
 
-Generate an improved JSON config for the {module_type} module suited to this {self.profile.domain} domain.
-Examples:
-  chunking:   {{"size": 400, "overlap": 60}}
-  embedding:  {{"model": "nomic-embed-text:latest", "batch_size": 50}}
-  retrieval:  {{"top_k": 7, "similarity": "cosine"}}
-  generation: {{"temperature": 0.4, "max_tokens": 350, "llm": "{LLM_MODEL}"}}
+# ============================================================
+# PART 5: KB ANALYSIS & PLANNING (called by setup-graph nodes)
+# ============================================================
+def _profile_documents(documents: List[Dict]) -> KBProfile:
+    p = KBProfile()
+    if not documents:
+        return p
+    lengths = [len(d["content"]) for d in documents]
+    p.doc_count = len(documents)
+    p.avg_doc_length = int(statistics.mean(lengths))
+    all_text = " ".join(d["content"] for d in documents)
 
-Return ONLY a JSON object:"""
+    code_pats = [r'\bdef \w+\(', r'\bclass \w+[:\(]', r'\bimport \w+',
+                 r'\bfunction\s+\w+\s*\(', r'```[\w]*\n']
+    p.has_code = sum(1 for pat in code_pats if re.search(pat, all_text)) >= 2
+    p.has_tables = bool(re.search(r'\|.+\|.+\|', all_text, re.MULTILINE))
+    p.has_lists = bool(re.search(r'^\s*[-•*]\s+\w+', all_text, re.MULTILINE))
+
+    # LLM classification
+    sample = "\n\n---\n\n".join(
+        f"[{d['filename']}]\n{d['content'][:1500]}" for d in documents[:5]
+    )
+    prompt = f"""Classify these documents. Return ONLY JSON:
+{{
+  "domain": "<medical|legal|technical|financial|code|scientific|general>",
+  "structure_type": "<narrative|qa|reference|code|mixed>",
+  "complexity": "<simple|moderate|complex>"
+}}
+
+SAMPLES:
+{sample}"""
+    try:
+        resp = RT.llm.invoke(prompt).content
+        m = re.search(r'\{.*\}', resp, re.DOTALL)
+        if m:
+            data = json.loads(m.group())
+            p.domain = data.get("domain", "general")
+            p.structure_type = data.get("structure_type", "mixed")
+            p.complexity = data.get("complexity", "moderate")
+    except Exception as e:
+        print(f"  ⚠  KB classification failed: {e}")
+    return p
+
+
+def _initial_config(profile: KBProfile) -> PipelineConfig:
+    cfg = PipelineConfig()
+    if profile.avg_doc_length < 500:
+        cfg.chunk_size, cfg.chunk_overlap, cfg.chunk_strategy = 200, 20, "sentence"
+    elif profile.avg_doc_length < 2000:
+        cfg.chunk_size, cfg.chunk_overlap = 400, 40
+    elif profile.avg_doc_length < 8000:
+        cfg.chunk_size, cfg.chunk_overlap = 700, 90
+    else:
+        cfg.chunk_size, cfg.chunk_overlap = 1024, 128
+    if profile.has_code:
+        cfg.chunk_strategy = "code"; cfg.chunk_size = 800; cfg.top_k = 7
+    if profile.domain in ("medical", "legal", "scientific"):
+        cfg.top_k = 8; cfg.temperature = 0.3; cfg.rerank_enabled = _CROSS_ENCODER_AVAILABLE
+    elif profile.domain == "financial":
+        cfg.temperature = 0.4
+    if profile.complexity == "complex":
+        cfg.top_k = min(cfg.top_k + 2, 12); cfg.temperature = max(cfg.temperature - 0.1, 0.1)
+    return cfg
+
+
+# ============================================================
+# PART 6: SETUP GRAPH STATE & NODES
+# ============================================================
+class SetupState(TypedDict, total=False):
+    """State for the build-time setup graph."""
+    documents:       List[Dict]
+    profile:         Dict           # serialized KBProfile
+    config:          Dict           # serialized PipelineConfig
+    baseline_score:  float
+    current_score:   float
+    best_score:      float
+    iteration:       int
+    optimizer_action:str            # 'tune_chunking'|'tune_retrieval'|'tune_generation'|'done'
+    optimizer_log:   Annotated[List[str], lambda a, b: a + b]  # appended each turn
+    notes:           Annotated[List[str], lambda a, b: a + b]
+
+
+# ── Setup Graph Nodes ───────────────────────────────────────────────────
+def node_load_kb(state: SetupState) -> Dict:
+    print("\n[setup] Loading knowledge base...")
+    docs = load_documents(KNOWLEDGE_BASE_PATH)
+    if not docs:
+        return {"documents": [], "notes": ["No documents found."]}
+    RT.documents = docs
+    print(f"  ✓ {len(docs)} document(s) loaded")
+    return {"documents": docs, "notes": [f"loaded {len(docs)} docs"]}
+
+
+def node_analyze_kb(state: SetupState) -> Dict:
+    print("\n[setup] Profiling knowledge base...")
+    profile = _profile_documents(state["documents"])
+    RT.profile = profile
+    print(f"  ✓ {profile.summary()}")
+    return {"profile": profile.to_dict(), "notes": [profile.summary()]}
+
+
+def node_plan_config(state: SetupState) -> Dict:
+    print("\n[setup] Planning initial pipeline config...")
+    profile = KBProfile(**state["profile"])
+    cfg = _initial_config(profile)
+    RT.config = cfg
+    print(f"  ✓ chunk_size={cfg.chunk_size}  top_k={cfg.top_k}  "
+          f"strategy={cfg.chunk_strategy}  temp={cfg.temperature}")
+    return {"config": cfg.to_dict(), "notes": [f"initial config: {cfg.to_dict()}"]}
+
+
+def node_index_kb(state: SetupState) -> Dict:
+    print("\n[setup] Indexing documents...")
+    cfg = PipelineConfig(**state["config"])
+    chunker = ContentAwareChunker(cfg.chunk_strategy, cfg.chunk_size, cfg.chunk_overlap)
+    RT.retriever.clear()
+    all_chunks, all_meta = [], []
+    for doc in state["documents"]:
+        chunks = chunker.chunk(doc["content"])
+        all_chunks.extend(chunks)
+        meta = {"source": doc["filename"], "ext": doc.get("ext", "txt")}
+        all_meta.extend([meta] * len(chunks))
+    RT.retriever.index(all_chunks, all_meta)
+    print(f"  ✓ {len(all_chunks)} chunks indexed")
+    return {"notes": [f"indexed {len(all_chunks)} chunks"]}
+
+
+def node_evaluate(state: SetupState) -> Dict:
+    """Compute semantic-similarity score across validation queries."""
+    val_queries = load_validation_set(VAL_QUERIES_PATH)
+    if not val_queries:
+        return {"baseline_score": 0.0, "current_score": 0.0, "best_score": 0.0}
+
+    total_sim, count = 0.0, 0
+    for item in val_queries:
         try:
-            response = self.llm.invoke(prompt).strip()
-            m = re.search(r'\{.*\}', response, re.DOTALL)
-            if m:
-                candidate = json.loads(m.group())
-                # Preserve required keys that LLM may have omitted
-                for k, v in current_config.items():
-                    candidate.setdefault(k, v)
-                return candidate
+            docs = RT.retriever.retrieve(item["query"], top_k=RT.config.top_k)
+            ans  = generate_answer.invoke({
+                "query": item["query"], "context": docs, "style": "factual"
+            })
+            embs = RT.embedder.embed([item["expected_answer"], ans])
+            sim  = RT.embedder.cosine(embs[0], embs[1])
+            total_sim += sim
+            count += 1
         except Exception as e:
-            print(f"  ⚠  Config generation failed ({e}); keeping current.")
-        return current_config
+            print(f"  ⚠  Eval error: {e}")
+
+    score = total_sim / max(count, 1)
+    baseline = state.get("baseline_score", score)
+    best = max(state.get("best_score", 0.0), score)
+    print(f"  ✓ Score: {score:.3f}  (baseline={baseline:.3f}  best={best:.3f})")
+    return {
+        "current_score": score,
+        "baseline_score": baseline,
+        "best_score": best,
+        "notes": [f"eval score={score:.3f}"],
+    }
 
 
-class FeedbackEncoder:
-    def __init__(self, llm_model: str = LLM_MODEL):
-        self.llm = Ollama(model=llm_model)
-
-    def encode(self, module_type: str, old_cfg: Dict, new_cfg: Dict,
-               metrics: Metrics, baseline: Metrics) -> str:
-        diff   = metrics.overall_score - baseline.overall_score
-        prompt = (
-            f"RAG optimization attempt for {module_type} module:\n"
-            f"Old: {old_cfg}\nNew: {new_cfg}\n"
-            f"Score change: {diff:+.3f}  "
-            f"(accuracy={metrics.answer_accuracy:.2f}, "
-            f"precision={metrics.retrieval_precision:.2f}, "
-            f"recall={metrics.retrieval_recall:.2f})\n\n"
-            f"Give ONE specific, actionable suggestion for the next configuration attempt."
-        )
-        try:
-            return self.llm.invoke(prompt).strip()
-        except Exception:
-            return "Try adjusting the parameters in the opposite direction."
-
-
-class OptimizerAgent:
+def node_optimizer_orchestrator(state: SetupState) -> Dict:
     """
-    Iterates over each module and applies KB-aware LLM-guided search
-    for better configurations. Accepts improvements; rolls back regressions.
+    THE AGENTIC HEART OF SETUP.
+    An LLM looks at the current state and decides which module to tune next.
+    Returns a structured action choice.
     """
+    iteration = state.get("iteration", 0) + 1
+    profile   = state["profile"]
+    config    = state["config"]
+    current   = state.get("current_score", 0.0)
+    best      = state.get("best_score",    0.0)
+    log       = state.get("optimizer_log", [])
 
-    # Modules optimized in dependency order (chunking first, generation last)
-    MODULE_ORDER = ["chunking", "retrieval", "generation", "reranking"]
+    if iteration > MAX_OPTIMIZER_TURNS:
+        return {"optimizer_action": "done", "iteration": iteration,
+                "notes": ["max optimizer turns reached"]}
 
-    def __init__(self, profile: KBProfile, evaluator: Evaluator, documents: List[Dict]):
-        self.profile          = profile
-        self.evaluator        = evaluator
-        self.documents        = documents
-        self.config_generator = KBAwareLLMModuleGenerator(profile)
-        self.feedback_encoder = FeedbackEncoder()
+    history = "\n".join(log[-5:]) if log else "(no prior attempts)"
+    prompt = f"""You are a RAG optimization orchestrator. Decide the next action.
 
-    def optimize(self, pipeline: AdaptiveRAGPipeline) -> AdaptiveRAGPipeline:
-        for module_type in self.MODULE_ORDER:
-            print(f"\n[OptimizerAgent] Optimizing: {module_type}")
-            best_config  = copy.deepcopy(pipeline.modules[module_type])
-            best_metrics = self.evaluator.baseline_metrics
-            feedback     = None
+KB PROFILE: {json.dumps(profile)}
+CURRENT CONFIG: {json.dumps(config)}
+CURRENT SCORE: {current:.3f}     BEST SO FAR: {best:.3f}
+ITERATION: {iteration}/{MAX_OPTIMIZER_TURNS}
 
-            for it in range(MAX_ITERATIONS_PER_MODULE):
-                print(f"  Iteration {it + 1}/{MAX_ITERATIONS_PER_MODULE}")
+RECENT OPTIMIZATION HISTORY:
+{history}
 
-                new_config = self.config_generator.generate_config(module_type, best_config, feedback)
-                pipeline.update_module(module_type, new_config)
+Choose ONE next action:
+  - "tune_chunking"    : try a different chunk_size or strategy (requires re-indexing)
+  - "tune_retrieval"   : try a different top_k
+  - "tune_generation"  : try a different temperature
+  - "tune_reranking"   : toggle reranking on/off
+  - "done"             : stop optimizing (if score is good enough or no progress likely)
 
-                if not pipeline.is_indexed:
-                    pipeline.index_documents(self.documents)
+Return ONLY JSON: {{"action": "<choice>", "reason": "<one sentence>"}}"""
 
-                metrics = self.evaluator.evaluate(pipeline)
-                print(f"  Score: {metrics.overall_score:.3f}  (best so far: {best_metrics.overall_score:.3f})")
-
-                if metrics.overall_score > best_metrics.overall_score:
-                    print(f"  ✅ Improvement accepted.")
-                    best_config  = copy.deepcopy(new_config)
-                    best_metrics = metrics
-                    self.evaluator.baseline_metrics = metrics
-                    break
-                else:
-                    print(f"  ❌ No improvement. Generating feedback...")
-                    feedback = self.feedback_encoder.encode(
-                        module_type, best_config, new_config, metrics, best_metrics
-                    )
-                    print(f"     → {feedback}")
-                    pipeline.update_module(module_type, best_config)
-                    if not pipeline.is_indexed:
-                        pipeline.index_documents(self.documents)
-            else:
-                print(f"  Keeping best config after {MAX_ITERATIONS_PER_MODULE} iterations.")
-                pipeline.update_module(module_type, best_config)
-
-        return pipeline
+    try:
+        resp = RT.llm.invoke(prompt).content
+        m = re.search(r'\{.*\}', resp, re.DOTALL)
+        action = "done"
+        reason = "no decision"
+        if m:
+            data = json.loads(m.group())
+            action = data.get("action", "done")
+            reason = data.get("reason", "")
+        print(f"\n[orchestrator] iter {iteration}: {action}  — {reason}")
+        return {
+            "optimizer_action": action,
+            "iteration": iteration,
+            "optimizer_log": [f"iter {iteration}: {action} ({reason})"],
+        }
+    except Exception as e:
+        print(f"  ⚠  Orchestrator failed: {e}")
+        return {"optimizer_action": "done", "iteration": iteration}
 
 
-# ======================== DATA LOADING ========================
+def _apply_and_score(cfg: PipelineConfig, state: SetupState,
+                     reindex: bool = False) -> Dict:
+    RT.config = cfg
+    extra = {}
+    if reindex:
+        extra = node_index_kb({"documents": state["documents"], "config": cfg.to_dict()})
+    eval_out = node_evaluate(state)
+    out = {"config": cfg.to_dict(), **eval_out}
+    out["notes"] = (extra.get("notes", []) + eval_out.get("notes", []))
+    return out
+
+
+def node_tune_chunking(state: SetupState) -> Dict:
+    cfg = PipelineConfig(**state["config"])
+    sizes = [s for s in CHUNK_SIZE_OPTIONS if s != cfg.chunk_size]
+    if not sizes: return {"notes": ["no chunk_size alternatives"]}
+    cfg.chunk_size = sizes[(state.get("iteration", 1) - 1) % len(sizes)]
+    cfg.chunk_overlap = max(cfg.chunk_size // 8, 32)
+    print(f"  → tuning chunk_size = {cfg.chunk_size}")
+    return _apply_and_score(cfg, state, reindex=True)
+
+
+def node_tune_retrieval(state: SetupState) -> Dict:
+    cfg = PipelineConfig(**state["config"])
+    options = [k for k in TOP_K_OPTIONS if k != cfg.top_k]
+    cfg.top_k = options[(state.get("iteration", 1) - 1) % len(options)]
+    print(f"  → tuning top_k = {cfg.top_k}")
+    return _apply_and_score(cfg, state, reindex=False)
+
+
+def node_tune_generation(state: SetupState) -> Dict:
+    cfg = PipelineConfig(**state["config"])
+    cfg.temperature = round(max(0.1, min(0.9,
+        cfg.temperature + (0.2 if cfg.temperature < 0.5 else -0.2))), 2)
+    print(f"  → tuning temperature = {cfg.temperature}")
+    return _apply_and_score(cfg, state, reindex=False)
+
+
+def node_tune_reranking(state: SetupState) -> Dict:
+    cfg = PipelineConfig(**state["config"])
+    cfg.rerank_enabled = not cfg.rerank_enabled and _CROSS_ENCODER_AVAILABLE
+    print(f"  → tuning rerank_enabled = {cfg.rerank_enabled}")
+    return _apply_and_score(cfg, state, reindex=False)
+
+
+def node_critique_and_commit(state: SetupState) -> Dict:
+    """
+    Reflection node: if score improved, keep the new config; otherwise log regression.
+    The conditional edge after this routes back to the orchestrator.
+    """
+    current = state.get("current_score", 0.0)
+    best    = state.get("best_score",    0.0)
+    if current >= best:
+        msg = f"✅ accepted (score {current:.3f} ≥ best {best:.3f})"
+        return {"best_score": current, "optimizer_log": [msg], "notes": [msg]}
+    msg = f"❌ rejected (score {current:.3f} < best {best:.3f})"
+    return {"optimizer_log": [msg], "notes": [msg]}
+
+
+# ── Routing ─────────────────────────────────────────────────────────────
+def route_optimizer(state: SetupState) -> str:
+    return state.get("optimizer_action", "done")
+
+
+# ── Build Setup Graph ───────────────────────────────────────────────────
+def build_setup_graph():
+    g = StateGraph(SetupState)
+    g.add_node("load",        node_load_kb)
+    g.add_node("analyze",     node_analyze_kb)
+    g.add_node("plan",        node_plan_config)
+    g.add_node("index",       node_index_kb)
+    g.add_node("evaluate",    node_evaluate)
+    g.add_node("orchestrate", node_optimizer_orchestrator)
+    g.add_node("tune_chunking",   node_tune_chunking)
+    g.add_node("tune_retrieval",  node_tune_retrieval)
+    g.add_node("tune_generation", node_tune_generation)
+    g.add_node("tune_reranking",  node_tune_reranking)
+    g.add_node("critique",    node_critique_and_commit)
+
+    g.add_edge(START, "load")
+    g.add_edge("load",     "analyze")
+    g.add_edge("analyze",  "plan")
+    g.add_edge("plan",     "index")
+    g.add_edge("index",    "evaluate")
+    g.add_edge("evaluate", "orchestrate")
+
+    g.add_conditional_edges(
+        "orchestrate",
+        route_optimizer,
+        {
+            "tune_chunking":   "tune_chunking",
+            "tune_retrieval":  "tune_retrieval",
+            "tune_generation": "tune_generation",
+            "tune_reranking":  "tune_reranking",
+            "done":            END,
+        },
+    )
+    for tune_node in ("tune_chunking", "tune_retrieval",
+                      "tune_generation", "tune_reranking"):
+        g.add_edge(tune_node, "critique")
+    g.add_edge("critique", "orchestrate")
+
+    return g.compile(checkpointer=MemorySaver())
+
+
+# ============================================================
+# PART 7: QUERY GRAPH STATE & NODES (PER-QUERY AGENT)
+# ============================================================
+class QueryState(TypedDict, total=False):
+    """State for the per-query agent graph."""
+    query:           str
+    source_filter:   Optional[str]
+    query_type:      str
+    strategy:        Dict        # {"use_hyde":bool, "use_rerank":bool, "use_multihop":bool}
+    expansions:      List[str]
+    retrieved_docs:  List[str]
+    retrieval_confidence: float
+    reranked_docs:   List[str]
+    answer:          str
+    confidence:      float
+    reflection:      str
+    retry_count:     int
+    trace:           Annotated[List[str], lambda a, b: a + b]
+
+
+def node_classify_query(state: QueryState) -> Dict:
+    """Lightweight regex + LLM-fallback classifier."""
+    q = state["query"].lower()
+    if any(w in q for w in ["compare", "vs ", "versus", "contrast", "difference"]):
+        qt = "comparison"
+    elif any(w in q for w in ["how to", "implement", "code", "function", "debug"]):
+        qt = "code"
+    elif any(w in q for w in ["why", "explain", "analyze", "implications"]):
+        qt = "analytical"
+    elif any(w in q for w in ["summarize", "summary", "overview", "tldr"]):
+        qt = "summarization"
+    else:
+        qt = "factual"
+    return {"query_type": qt, "trace": [f"classified as: {qt}"]}
+
+
+def node_strategy_orchestrator(state: QueryState) -> Dict:
+    """
+    THE AGENTIC HEART OF QUERY-TIME.
+    LLM decides which tools to use for THIS query based on type + profile + retries.
+    Different queries take different paths through the graph.
+    """
+    retries = state.get("retry_count", 0)
+    prev_reflection = state.get("reflection", "")
+    qtype = state.get("query_type", "factual")
+    profile = RT.profile.to_dict() if RT.profile else {}
+
+    retry_hint = ""
+    if retries > 0:
+        retry_hint = (f"\nThis is retry #{retries}. Previous attempt feedback:\n"
+                      f"  {prev_reflection}\nChange the strategy.")
+
+    prompt = f"""You are a RAG query strategist. Decide which tools to use for this query.
+
+Query: "{state['query']}"
+Type: {qtype}
+KB Profile: {json.dumps(profile)}{retry_hint}
+
+Return ONLY JSON:
+{{
+  "use_hyde": <true|false>,        // expand query with hypothetical answer
+  "use_multihop": <true|false>,    // do a second retrieval pass with a follow-up question
+  "use_rerank": <true|false>,      // apply cross-encoder reranking
+  "top_k": <integer 3-15>,         // how many docs to retrieve
+  "reason": "<one-sentence justification>"
+}}
+
+Guidelines:
+- Factual short queries → minimal tools (no hyde, no multihop, no rerank)
+- Analytical/comparison queries → use rerank, often multihop
+- Vague queries → use hyde to expand
+- Code queries → higher top_k, no rerank"""
+
+    try:
+        resp = RT.llm.invoke(prompt).content
+        m = re.search(r'\{.*\}', resp, re.DOTALL)
+        if m:
+            strategy = json.loads(m.group())
+        else:
+            strategy = {"use_hyde": False, "use_multihop": False, "use_rerank": False,
+                        "top_k": RT.config.top_k, "reason": "fallback"}
+    except Exception as e:
+        strategy = {"use_hyde": False, "use_multihop": False, "use_rerank": False,
+                    "top_k": RT.config.top_k, "reason": f"error: {e}"}
+
+    return {
+        "strategy": strategy,
+        "trace": [f"strategy: {strategy}"],
+    }
+
+
+def node_expand_query(state: QueryState) -> Dict:
+    if not state.get("strategy", {}).get("use_hyde"):
+        return {"expansions": [state["query"]]}
+    hypothetical = expand_query_hyde.invoke({"query": state["query"]})
+    expansions = [state["query"], hypothetical]
+    return {"expansions": expansions, "trace": [f"hyde expansion added ({len(hypothetical)} chars)"]}
+
+
+def node_retrieve(state: QueryState) -> Dict:
+    queries = state.get("expansions") or [state["query"]]
+    top_k   = state.get("strategy", {}).get("top_k", RT.config.top_k)
+    src     = state.get("source_filter")
+
+    seen, docs = set(), []
+    for q in queries:
+        for d in retrieve_documents.invoke({
+            "query": q, "top_k": top_k, "source_filter": src,
+        }):
+            if d not in seen:
+                seen.add(d); docs.append(d)
+    return {"retrieved_docs": docs, "trace": [f"retrieved {len(docs)} unique docs"]}
+
+
+def node_retrieval_critic(state: QueryState) -> Dict:
+    """
+    LLM-based judge: are these docs sufficient to answer the query?
+    Score → conditional edge decides whether multihop is needed.
+    """
+    docs = state.get("retrieved_docs", [])
+    if not docs:
+        return {"retrieval_confidence": 0.0, "trace": ["no docs retrieved"]}
+
+    sample = "\n".join(f"- {d[:200]}..." for d in docs[:3])
+    prompt = f"""Rate how sufficient these retrieved documents are for answering the query.
+
+Query: {state['query']}
+Sample of retrieved chunks:
+{sample}
+
+Return ONLY JSON: {{"score": <0.0-1.0>, "reason": "<brief>"}}
+1.0 = clearly contains the answer.  0.0 = totally irrelevant."""
+
+    try:
+        resp = RT.llm.invoke(prompt).content
+        m = re.search(r'\{.*\}', resp, re.DOTALL)
+        score = float(json.loads(m.group()).get("score", 0.5)) if m else 0.5
+    except Exception:
+        score = 0.5
+    return {
+        "retrieval_confidence": score,
+        "trace": [f"retrieval confidence: {score:.2f}"],
+    }
+
+
+def node_multihop_retrieve(state: QueryState) -> Dict:
+    """Generate a follow-up question and retrieve more docs."""
+    docs = state.get("retrieved_docs", [])
+    preview = "\n".join(docs[:3])[:1500]
+    sub_prompt = (
+        f"Based on these partial results, what FOLLOW-UP question would "
+        f"retrieve the missing information for: '{state['query']}'?\n\n"
+        f"Context so far:\n{preview}\n\nFollow-up question (one sentence):"
+    )
+    try:
+        sub_q = RT.llm.invoke(sub_prompt).content.strip()
+        more = retrieve_documents.invoke({
+            "query": sub_q, "top_k": max(RT.config.top_k // 2, 2),
+            "source_filter": state.get("source_filter"),
+        })
+        existing = set(docs)
+        added = [d for d in more if d not in existing]
+        return {
+            "retrieved_docs": docs + added,
+            "trace": [f"multihop added {len(added)} docs via: {sub_q[:80]}..."],
+        }
+    except Exception as e:
+        return {"trace": [f"multihop failed: {e}"]}
+
+
+def node_rerank(state: QueryState) -> Dict:
+    if not state.get("strategy", {}).get("use_rerank"):
+        return {"reranked_docs": state.get("retrieved_docs", [])}
+    docs = state.get("retrieved_docs", [])
+    ranked = rerank_documents.invoke({"query": state["query"], "docs": docs})
+    return {"reranked_docs": ranked, "trace": ["reranked via cross-encoder"]}
+
+
+def node_generate(state: QueryState) -> Dict:
+    docs = state.get("reranked_docs") or state.get("retrieved_docs", [])
+    answer = generate_answer.invoke({
+        "query": state["query"], "context": docs,
+        "style": state.get("query_type", "factual"),
+    })
+    return {"answer": answer, "trace": [f"generated {len(answer)} chars"]}
+
+
+def node_answer_critic(state: QueryState) -> Dict:
+    """
+    Reflection: LLM critiques its own answer.
+    If confidence is below threshold, the conditional edge routes back to retry.
+    """
+    answer = state.get("answer", "")
+    docs = state.get("reranked_docs") or state.get("retrieved_docs", [])
+    if not answer or not docs:
+        return {"confidence": 0.0, "reflection": "no answer or no context"}
+
+    ctx = "\n".join(f"[{i+1}] {d[:200]}..." for i, d in enumerate(docs[:5]))
+    prompt = f"""Evaluate this RAG answer.
+
+Query: {state['query']}
+Answer: {answer}
+
+Available context (truncated):
+{ctx}
+
+Return ONLY JSON:
+{{
+  "confidence": <0.0-1.0>,
+  "grounded": <true|false>,
+  "complete": <true|false>,
+  "issues": "<comma-separated issues, or 'none'>"
+}}
+
+confidence < 0.5 means: hallucinated, missing key facts, or off-topic."""
+    try:
+        resp = RT.llm.invoke(prompt).content
+        m = re.search(r'\{.*\}', resp, re.DOTALL)
+        if m:
+            data = json.loads(m.group())
+            conf = float(data.get("confidence", 0.5))
+            reflection = (f"grounded={data.get('grounded')}, "
+                          f"complete={data.get('complete')}, "
+                          f"issues={data.get('issues')}")
+        else:
+            conf, reflection = 0.5, "no parse"
+    except Exception as e:
+        conf, reflection = 0.5, f"error: {e}"
+    return {
+        "confidence": conf,
+        "reflection": reflection,
+        "trace": [f"answer confidence: {conf:.2f} ({reflection})"],
+    }
+
+
+# ── Conditional routers ─────────────────────────────────────────────────
+def route_after_retrieval(state: QueryState) -> str:
+    if state.get("retrieval_confidence", 0.0) < RETRIEVAL_THRESHOLD \
+       and state.get("strategy", {}).get("use_multihop"):
+        return "multihop"
+    return "rerank"
+
+
+def route_after_reflection(state: QueryState) -> str:
+    if state.get("confidence", 1.0) < CONFIDENCE_THRESHOLD \
+       and state.get("retry_count", 0) < MAX_QUERY_RETRIES:
+        return "retry"
+    return "finish"
+
+
+def node_prepare_retry(state: QueryState) -> Dict:
+    """Increment retry counter; preserve reflection for the strategist."""
+    return {
+        "retry_count": state.get("retry_count", 0) + 1,
+        "trace": [f"retry #{state.get('retry_count', 0) + 1} (conf was low)"],
+    }
+
+
+# ── Build Query Graph ───────────────────────────────────────────────────
+def build_query_graph():
+    g = StateGraph(QueryState)
+    g.add_node("classify",       node_classify_query)
+    g.add_node("strategize",     node_strategy_orchestrator)
+    g.add_node("expand",         node_expand_query)
+    g.add_node("retrieve",       node_retrieve)
+    g.add_node("retrieval_critic", node_retrieval_critic)
+    g.add_node("multihop",       node_multihop_retrieve)
+    g.add_node("rerank",         node_rerank)
+    g.add_node("generate",       node_generate)
+    g.add_node("reflect",        node_answer_critic)
+    g.add_node("retry",          node_prepare_retry)
+
+    g.add_edge(START, "classify")
+    g.add_edge("classify",   "strategize")
+    g.add_edge("strategize", "expand")
+    g.add_edge("expand",     "retrieve")
+    g.add_edge("retrieve",   "retrieval_critic")
+
+    g.add_conditional_edges(
+        "retrieval_critic",
+        route_after_retrieval,
+        {"multihop": "multihop", "rerank": "rerank"},
+    )
+    g.add_edge("multihop", "rerank")
+    g.add_edge("rerank",   "generate")
+    g.add_edge("generate", "reflect")
+
+    g.add_conditional_edges(
+        "reflect",
+        route_after_reflection,
+        {"retry": "retry", "finish": END},
+    )
+    g.add_edge("retry", "strategize")   # loop back to re-plan
+
+    return g.compile(checkpointer=MemorySaver())
+
+
+# ============================================================
+# PART 8: FILE LOADING (extended formats)
+# ============================================================
+def _read_txt(p): return open(p, "r", encoding="utf-8", errors="ignore").read()
+def _read_pdf(p):
+    r = pypdf.PdfReader(p)
+    return "".join(pg.extract_text() or "" for pg in r.pages)
+def _read_md(p):
+    t = open(p, "r", encoding="utf-8", errors="ignore").read()
+    t = re.sub(r'```[\w]*\n', '', t); t = re.sub(r'```', '', t)
+    t = re.sub(r'^#{1,6}\s+', '', t, flags=re.MULTILINE)
+    t = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', t)
+    return re.sub(r'[*_`~]', '', t)
+def _read_docx(p):
+    if not _DOCX_AVAILABLE: return ""
+    return "\n".join(p.text for p in python_docx.Document(p).paragraphs if p.text.strip())
+
+_READERS = {".txt": _read_txt, ".pdf": _read_pdf, ".md": _read_md, ".docx": _read_docx}
+
+
 def load_documents(folder: str) -> List[Dict]:
     docs = []
-    for file in glob.glob(os.path.join(folder, "*.*")):
-        content = ""
-        if file.endswith(".txt"):
-            with open(file, "r", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-        elif file.endswith(".pdf"):
-            reader  = pypdf.PdfReader(file)
-            content = "".join(page.extract_text() or "" for page in reader.pages)
-        else:
-            continue
+    for f in sorted(glob.glob(os.path.join(folder, "*.*"))):
+        ext = Path(f).suffix.lower()
+        reader = _READERS.get(ext)
+        if not reader: continue
+        try:
+            content = reader(f)
+        except Exception as e:
+            print(f"  ⚠  Couldn't read {f}: {e}"); continue
         if content.strip():
-            docs.append({"filename": os.path.basename(file), "content": content})
+            docs.append({"filename": os.path.basename(f), "content": content,
+                         "path": f, "ext": ext.lstrip(".")})
     return docs
 
 
 def load_validation_set(path: str) -> List[Dict]:
     if not os.path.exists(path):
         sample = [{"query": "What is the main topic?", "expected_answer": "unknown"}]
-        with open(path, "w") as f:
-            json.dump(sample, f, indent=2)
-        print(f"  Created sample validation set at {path}. Replace with real data.")
+        with open(path, "w") as fp: json.dump(sample, fp, indent=2)
         return sample
-    with open(path, "r") as f:
-        return json.load(f)
+    with open(path) as fp: return json.load(fp)
 
 
-# ======================== MAIN ORCHESTRATOR ========================
-def run_adaptive_rag():
-    """
-    Full 5-agent pipeline:
-      Load → Analyze → Plan → Index → Baseline → Optimize → Serve
-    """
-    banner = "=" * 62
-    print(f"\n{banner}")
-    print("   Adaptive Agentic RAG Framework")
-    print(banner)
+# ============================================================
+# PART 9: MAIN — compose the two graphs and serve
+# ============================================================
+def main():
+    print("=" * 70)
+    print("  Agentic RAG Framework — LangGraph Edition")
+    print("=" * 70)
 
-    # ── Load ─────────────────────────────────────────────────────────────
-    print("\n[Loader] Loading knowledge base...")
-    documents   = load_documents(KNOWLEDGE_BASE_PATH)
-    val_queries = load_validation_set(VAL_QUERIES_PATH)
-    if not documents:
-        print(f"❌  No .txt or .pdf files found in '{KNOWLEDGE_BASE_PATH}'")
-        return
-    print(f"  ✓ {len(documents)} document(s) loaded")
+    # Initialize the global runtime
+    RT.embedder  = Embedder()
+    RT.retriever = Retriever(RT.embedder)
+    RT.reranker  = Reranker()
+    RT.llm       = ChatOllama(model=LLM_MODEL, temperature=0.0)        # decisions
+    RT.answer_llm= ChatOllama(model=LLM_MODEL, temperature=0.5)        # answers
 
-    # ── Agent 1: Analyze ─────────────────────────────────────────────────
-    profile = KBAnalyzerAgent().analyze(documents)
+    # ── Run Setup Graph ──────────────────────────────────────────────────
+    print("\n>>> Compiling setup graph...")
+    setup_graph = build_setup_graph()
+    setup_config = {"configurable": {"thread_id": "setup-1"}}
 
-    # ── Agent 2: Plan ────────────────────────────────────────────────────
-    planned_config = PlannerAgent().plan(profile)
+    print(">>> Invoking setup graph...\n")
+    final_setup_state = setup_graph.invoke(
+        {"iteration": 0, "optimizer_log": [], "notes": []},
+        config=setup_config,
+    )
 
-    # Build initial pipeline from the plan
-    modules = {k: v for k, v in planned_config.items() if k != "chunk_strategy"}
-    modules["chunk_strategy"] = planned_config.get("chunk_strategy", "fixed")
+    print("\n" + "=" * 70)
+    print(f"  Setup complete.")
+    print(f"  Final config : {final_setup_state['config']}")
+    print(f"  Final score  : {final_setup_state.get('best_score', 0.0):.3f}")
+    print("=" * 70)
 
-    pipeline = AdaptiveRAGPipeline(modules, profile)
+    # ── Compile Query Graph and Serve ────────────────────────────────────
+    print("\n>>> Compiling query graph...")
+    query_graph = build_query_graph()
 
-    # ── Agent 3: Index ───────────────────────────────────────────────────
-    pipeline.index_documents(documents)
+    print("\n✅  Agentic RAG ready.")
+    print("    Commands:")
+    print("      Any question              → routed through agentic graph")
+    print("      'from:<file> <question>'  → restrict retrieval to one source")
+    print("      'trace'                   → show the last query's full trace")
+    print("      'exit'                    → quit\n")
 
-    # ── Baseline evaluation ──────────────────────────────────────────────
-    evaluator        = Evaluator(val_queries, pipeline)
-    baseline_score   = evaluator.baseline_metrics.overall_score
-    print(f"\n[Evaluator] Baseline score: {baseline_score:.3f}")
-
-    # ── Agent 4: Optimize ────────────────────────────────────────────────
-    optimizer = OptimizerAgent(profile, evaluator, documents)
-    pipeline  = optimizer.optimize(pipeline)
-
-    # ── Final report ─────────────────────────────────────────────────────
-    final = evaluator.evaluate(pipeline)
-    delta = final.overall_score - baseline_score
-    print(f"\n{banner}")
-    print(f"  Final score : {final.overall_score:.3f}  (Δ {delta:+.3f})")
-    print(f"  Accuracy    : {final.answer_accuracy:.3f}")
-    print(f"  Avg latency : {final.latency_ms:.0f} ms")
-    print(banner)
-
-    # ── Agent 5: Serve with query routing ────────────────────────────────
-    print("\n✅  Adaptive RAG ready.")
-    print("    Commands:  'profile' → KB summary | 'config' → pipeline config | 'exit'\n")
+    last_trace = []
     while True:
         try:
             q = input("> ").strip()
         except (KeyboardInterrupt, EOFError):
-            print("\nBye!")
-            break
-        if not q:
+            print("\nBye!"); break
+        if not q: continue
+        if q.lower() == "exit": break
+        if q.lower() == "trace":
+            for step in last_trace: print(f"  - {step}")
             continue
-        if q.lower() == "exit":
-            break
-        if q.lower() == "profile":
-            print(f"\n{profile.summary()}\n")
-            continue
-        if q.lower() == "config":
-            print(json.dumps(
-                {k: v for k, v in pipeline.modules.items() if k != "chunk_strategy"},
-                indent=2
-            ))
-            continue
-        answer = pipeline.answer(q, verbose=True)
-        print(f"\n{answer}\n")
+
+        source_filter = None
+        if q.lower().startswith("from:"):
+            parts = q.split(" ", 1)
+            if len(parts) == 2:
+                source_filter, q = parts[0][5:], parts[1]
+
+        thread_id = f"query-{int(time.time())}"
+        result = query_graph.invoke(
+            {
+                "query": q,
+                "source_filter": source_filter,
+                "retry_count": 0,
+                "trace": [],
+            },
+            config={"configurable": {"thread_id": thread_id}},
+        )
+        last_trace = result.get("trace", [])
+        print(f"\n{result.get('answer', '(no answer)')}\n")
+        print(f"  [confidence={result.get('confidence', 0):.2f}  "
+              f"retries={result.get('retry_count', 0)}  "
+              f"strategy={result.get('strategy', {}).get('reason', '?')}]\n")
 
 
 if __name__ == "__main__":
-    run_adaptive_rag()
+    main()
