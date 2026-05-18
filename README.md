@@ -46,7 +46,7 @@ This framework detects what kind of knowledge base it has, then configures itsel
 
 ```
 adaptive-rag-framework/
-├── adaptive_rag.py          # Main framework (all 5 agents)
+├── ragCreator.py          # Main framework (all 5 agents)
 ├── knowledge_base/          # Drop your .txt or .pdf files here
 ├── validation_queries.json  # Optional: query/answer pairs for optimization
 ├── assets/
@@ -107,7 +107,7 @@ If this file is absent, a sample one is created automatically and the optimizer 
 ### 5. Run
 
 ```bash
-python adaptive_rag.py
+python ragCreator.py
 ```
 
 The framework will:
@@ -186,7 +186,7 @@ Once the pipeline is ready:
 ## 🧩 Component Map
 
 ```
-adaptive_rag.py
+ragCreator.py
 │
 ├── KBProfile                    dataclass — KB characteristics
 ├── KBAnalyzerAgent              statistical + LLM content profiling
