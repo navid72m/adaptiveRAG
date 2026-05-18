@@ -1,299 +1,155 @@
-<div align="center">
+# adaptiverag
 
-# 🧠 Adaptive Agentic RAG Framework
+**Agentic RAG that thinks before it retrieves.**
 
-**A self-configuring RAG pipeline that analyzes your knowledge base and intelligently adapts every pipeline parameter — chunking strategy, retrieval depth, temperature, reranking — before you ask a single question.**
-
-[![Python](https://img.shields.io/badge/Python-3.9%2B-blue?logo=python&logoColor=white)](https://www.python.org/)
-[![Ollama](https://img.shields.io/badge/Ollama-local%20LLM-black?logo=llama&logoColor=white)](https://ollama.com/)
-[![ChromaDB](https://img.shields.io/badge/ChromaDB-vector%20store-orange)](https://www.trychroma.com/)
-[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
-[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)](CONTRIBUTING.md)
-
-</div>
+`adaptiverag` is a fully local, self-optimising Retrieval-Augmented Generation framework built on [LangGraph](https://github.com/langchain-ai/langgraph) and [Ollama](https://ollama.com). It runs two autonomous agent graphs — one that analyses and indexes your knowledge base at startup, and one that routes every query through the best possible retrieval strategy at runtime.
 
 ---
 
-## 📐 Architecture
+## Why adaptiverag?
 
-![Adaptive Agentic RAG Framework Architecture](architecture.png)
+Most RAG pipelines run the same fixed sequence for every query. `adaptiverag` treats retrieval as a decision problem:
 
-Five cooperative agents work in sequence at startup — then the pipeline serves queries with per-request routing:
-
-| # | Agent | Role |
-|---|-------|------|
-| 1 | **KBAnalyzerAgent** | Statistical profiling + LLM classification of domain, structure, complexity |
-| 2 | **PlannerAgent** | Translates the KB profile into an optimal initial pipeline configuration |
-| 3 | **IndexerAgent** | Chunks, embeds, and stores documents using the planned strategy |
-| 4 | **OptimizerAgent** | Iteratively tunes every module with KB-aware LLM feedback loops |
-| 5 | **QueryRouterAgent** | Classifies each query at runtime and tunes `top_k` / reranking per request |
-
----
-
-## ✨ Why Adaptive?
-
-Traditional RAG pipelines use the same chunk size, retrieval depth, and generation temperature for every knowledge base. This fails:
-
-- A **medical corpus** needs conservative generation (`temperature=0.2`) and broad retrieval (`top_k=10`) with reranking
-- A **code repository** needs code-boundary splitting and exact-match retrieval (`top_k=7`)
-- A **Q&A dataset** works best with small paragraph chunks (`size=250`) and low `top_k`
-
-This framework detects what kind of knowledge base it has, then configures itself accordingly — and continues improving through a feedback loop.
+| Fixed pipeline | adaptiverag |
+|---|---|
+| Same chunk size for all docs | Analyses doc structure, picks chunk strategy automatically |
+| Fixed top-k for every query | LLM-chosen top-k per query based on type and complexity |
+| No query expansion | Uses HyDE expansion for vague queries |
+| Single-pass retrieval | Multi-hop follow-up retrieval when first pass is insufficient |
+| No quality check | Critic node scores the answer; retries with a new strategy if confidence is low |
+| Manual parameter tuning | Optimizer agent tunes chunk size, top-k, temperature, and reranking automatically |
 
 ---
 
-## 🗂️ Project Structure
+## How it works
+
+### Setup graph (runs once at startup)
 
 ```
-adaptive-rag-framework/
-├── ragCreator.py          # Main framework (all 5 agents)
-├── knowledge_base/          # Drop your .txt or .pdf files here
-├── validation_queries.json  # Optional: query/answer pairs for optimization
-├── assets/
-│   └── architecture.png     # System architecture diagram
-├── requirements.txt
-├── .gitignore
-└── README.md
+load docs → profile KB → plan config → index → evaluate → orchestrate ──┐
+                                                              ↑           │
+                                                         critique ←── tune_*
 ```
+
+The orchestrator LLM analyses the knowledge base profile and current scores, then decides which parameter to tune next. It loops until scores stop improving or the iteration budget runs out.
+
+### Query graph (runs per query)
+
+```
+classify → strategize → expand → retrieve → retrieval_critic ──┐
+                ↑                                    ↓          │
+              retry ← reflect ← generate ← rerank ← multihop ──┘
+```
+
+The strategist LLM picks tools (HyDE, multi-hop, reranker) based on query type. The answer critic scores the result and routes back for a retry if confidence is below the threshold.
 
 ---
 
-## 🚀 Quick Start
-
-### 1. Prerequisites
-
-Install [Ollama](https://ollama.com/) and pull the required models:
+## Installation
 
 ```bash
-ollama pull gemma4:latest
-ollama pull nomic-embed-text:latest
+pip install adaptiverag
+
+# Optional: cross-encoder reranking (improves precision on complex queries)
+pip install "adaptiverag[reranker]"
 ```
 
-### 2. Clone & install
+Requires [Ollama](https://ollama.com/download) running locally. Any missing models are **pulled automatically** on first run — no manual `ollama pull` needed.
+
+---
+
+## Quick start
+
+```python
+from adaptiverag import build_rag
+
+# Indexes ./knowledge_base, auto-tunes the pipeline, returns a ready instance
+rag = build_rag()
+
+result = rag.ask("What are the main findings?")
+print(result)                  # prints the answer
+print(result.confidence)       # 0.0 – 1.0
+print(result.strategy)         # one-line explanation of what the agent chose
+print(result.trace)            # full step-by-step reasoning trace
+```
+
+### Custom paths and models
+
+```python
+rag = build_rag(
+    llm_model        = "llama3.2:latest",           # any Ollama model
+    embed_model      = "nomic-embed-text:latest",
+    kb_path          = "/path/to/your/documents",
+    val_queries_path = "/path/to/validation.json",  # optional — auto-generated if omitted
+)
+```
+
+### Restrict retrieval to one file
+
+```python
+result = rag.ask("Summarise the methodology", source_filter="paper.pdf")
+# or using the inline prefix:
+result = rag.ask("from:paper.pdf Summarise the methodology")
+```
+
+### CLI
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/adaptive-rag-framework.git
-cd adaptive-rag-framework
-pip install -r requirements.txt
+adaptiverag
 ```
 
-### 3. Add your knowledge base
+---
 
-Drop `.txt` or `.pdf` files into the `knowledge_base/` folder:
+## Supported document formats
 
-```bash
-cp my_documents/*.pdf knowledge_base/
-```
+| Format | Extension |
+|---|---|
+| Plain text | `.txt` |
+| PDF | `.pdf` |
+| Markdown | `.md` |
+| Word | `.docx` |
 
-### 4. (Optional) Add validation queries
+Drop files into your `knowledge_base/` folder. Mixed formats are supported.
 
-Create `validation_queries.json` to enable the optimizer agent:
+---
+
+## Validation queries
+
+The optimizer tunes pipeline parameters by scoring answers against expected answers. You can provide your own:
 
 ```json
 [
   {
-    "query": "What is the main topic of this document?",
-    "expected_answer": "machine learning"
-  },
-  {
-    "query": "Who are the primary authors?",
-    "expected_answer": "Smith and Jones"
+    "query": "What problem does this paper solve?",
+    "expected_answer": "The paper addresses the challenge of ..."
   }
 ]
 ```
 
-If this file is absent, a sample one is created automatically and the optimizer skips scoring.
-
-### 5. Run
-
-```bash
-python ragCreator.py
-```
-
-The framework will:
-1. Profile your knowledge base (domain, structure, complexity)
-2. Plan the optimal pipeline configuration
-3. Index all documents with the chosen chunking strategy
-4. Run the optimizer to improve every module
-5. Drop you into an interactive query shell
+Pass the path via `val_queries_path`. If you omit it, `adaptiverag` generates queries automatically from your documents using the LLM and saves them to `./validation_queries.json` for you to review and edit.
 
 ---
 
-## 🔍 What Gets Adapted
+## QueryResult fields
 
-### Chunking strategy (4 modes)
-
-| Strategy | Best for | Chunk size |
-|----------|----------|-----------|
-| `fixed` | Homogeneous prose | Configurable |
-| `sentence` | Short documents, Q&A | Small (200–400) |
-| `paragraph` | Narrative / technical | Medium (400–800) |
-| `code` | Source code corpora | Large (800+), boundary-aware |
-
-### Retrieval depth
-
-`top_k` is set by domain and complexity, then adjusted per query type at runtime:
-
-| Query type | `top_k` adjustment | Reranking |
-|------------|-------------------|-----------|
-| `factual` | base | ✗ |
-| `analytical` | base + 3 | ✓ |
-| `code` | base + 2 | ✗ |
-| `comparison` | base + 4 | ✓ |
-| `summarization` | base + 5 | ✗ |
-
-### Generation temperature
-
-| Domain | Temperature |
-|--------|-------------|
-| Medical / Legal / Scientific | 0.2 – 0.3 |
-| Financial | 0.4 |
-| Technical / Code | 0.5 |
-| General / Historical | 0.7 |
+| Field | Type | Description |
+|---|---|---|
+| `answer` | `str` | The generated answer (`str(result)` also works) |
+| `confidence` | `float` | Self-assessed confidence, 0.0 – 1.0 |
+| `retries` | `int` | Number of reflection retries needed |
+| `strategy` | `str` | One-line explanation of the agent's retrieval strategy |
+| `trace` | `list[str]` | Step-by-step log of every decision made |
 
 ---
 
-## 🔧 Configuration
+## Requirements
 
-Top-level constants in `adaptive_rag.py`:
-
-```python
-KNOWLEDGE_BASE_PATH       = "./knowledge_base"    # Path to your documents
-VAL_QUERIES_PATH          = "./validation_queries.json"
-MAX_ITERATIONS_PER_MODULE = 3                     # Optimizer iterations per module
-IMPROVEMENT_THRESHOLD     = 0.05                  # Minimum score gain to accept a change
-LLM_MODEL                 = "gemma4:latest"       # Any Ollama-compatible model
-EMBED_MODEL               = "nomic-embed-text:latest"
-KB_SAMPLE_DOCS            = 5                     # Docs fed to analyzer LLM
-KB_SAMPLE_CHARS           = 2000                  # Chars per doc sample
-```
+- Python ≥ 3.10
+- [Ollama](https://ollama.com/download) running locally (`http://localhost:11434`)
+- At least one chat model and one embedding model available in Ollama (auto-pulled if missing)
 
 ---
 
-## 💬 Interactive Shell Commands
+## License
 
-Once the pipeline is ready:
-
-| Command | Description |
-|---------|-------------|
-| Any question | Routed and answered using the optimized pipeline |
-| `profile` | Print the detected KB profile |
-| `config` | Print the current pipeline configuration JSON |
-| `exit` | Quit |
-
----
-
-## 🧩 Component Map
-
-```
-ragCreator.py
-│
-├── KBProfile                    dataclass — KB characteristics
-├── KBAnalyzerAgent              statistical + LLM content profiling
-├── PlannerAgent                 heuristics + LLM config planning
-├── ContentAwareChunker          fixed / sentence / paragraph / code splitting
-├── Embedder                     OllamaEmbeddings wrapper with batching
-├── Retriever                    ChromaDB indexer + cosine-similarity search
-├── Reranker                     pluggable cross-encoder (stub ready)
-├── Generator                    Ollama LLM with query-type-aware prompts
-├── QueryRouterAgent             regex + LLM query classifier
-├── AdaptiveRAGPipeline          wires all components; supports hot-swap
-├── Evaluator                    accuracy / precision / recall / latency
-├── KBAwareLLMModuleGenerator    KB-context-aware config proposals
-├── FeedbackEncoder              translates metrics delta → LLM guidance
-└── OptimizerAgent               iterative module-by-module optimizer
-```
-
----
-
-## 📊 Evaluation Metrics
-
-The `Evaluator` computes three signals:
-
-- **Answer accuracy** — exact-match overlap between generated and expected answers
-- **Retrieval precision** — fraction of retrieved chunks that are relevant
-- **Retrieval recall** — fraction of relevant chunks that were retrieved
-- **Overall score** — `0.7 × accuracy + 0.3 × F1(precision, recall)`
-
-The optimizer only accepts a new module config when `overall_score` improves by at least `IMPROVEMENT_THRESHOLD` (default 5%).
-
----
-
-## 🔌 Extending the Framework
-
-### Swap in a different LLM
-
-Change `LLM_MODEL` to any model available in your Ollama installation:
-
-```python
-LLM_MODEL = "llama3.2:latest"
-```
-
-### Add a real reranker
-
-Replace the stub in `Reranker.rerank()` with a cross-encoder:
-
-```python
-from sentence_transformers import CrossEncoder
-
-class Reranker:
-    def __init__(self, config):
-        self.enabled = config.get("enabled", False)
-        if self.enabled:
-            self.model = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-
-    def rerank(self, query, docs):
-        if not self.enabled:
-            return docs
-        pairs  = [[query, doc] for doc in docs]
-        scores = self.model.predict(pairs)
-        return [doc for _, doc in sorted(zip(scores, docs), reverse=True)]
-```
-
-### Support more file formats
-
-Add a branch in `load_documents()`:
-
-```python
-elif file.endswith(".md"):
-    with open(file, "r", encoding="utf-8") as f:
-        content = f.read()
-```
-
----
-
-## 🛠️ Requirements
-
-```
-pypdf>=4.0.0
-chromadb>=0.4.0
-langchain-ollama>=0.1.0
-langchain-community>=0.2.0
-tqdm>=4.65.0
-```
-
----
-
-## 📄 License
-
-MIT — see [LICENSE](LICENSE).
-
----
-
-## 🤝 Contributing
-
-Pull requests are welcome. For major changes, please open an issue first to discuss what you'd like to change.
-
-1. Fork the repo
-2. Create a feature branch (`git checkout -b feature/my-improvement`)
-3. Commit your changes (`git commit -m 'Add cross-encoder reranker'`)
-4. Push to the branch (`git push origin feature/my-improvement`)
-5. Open a Pull Request
-
----
-
-<div align="center">
-
-Built with [Ollama](https://ollama.com/) · [ChromaDB](https://www.trychroma.com/) · [LangChain](https://www.langchain.com/)
-
-</div>
+MIT
