@@ -1,4 +1,10 @@
-# adaptiverag
+# adaptiveRAG
+
+![PyPI](https://img.shields.io/pypi/v/adaptiverag)
+![Python Versions](https://img.shields.io/pypi/pyversions/adaptiverag)
+![Downloads](https://static.pepy.tech/badge/adaptiverag)
+![License](https://img.shields.io/github/license/navid72m/adaptiveRAG)
+![Stars](https://img.shields.io/github/stars/navid72m/adaptiveRAG)
 
 **Agentic RAG that thinks before it retrieves.**
 
