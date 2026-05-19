@@ -1,0 +1,37 @@
+[build-system]
+requires      = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name        = "adaptiverag"
+version     = "1.0.1"
+description = "Agentic RAG Framework built with LangGraph and Ollama"
+readme      = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+
+dependencies = [
+    "langgraph>=0.2",
+    "langchain-core>=0.3",
+    "langchain-ollama>=0.2",
+    "langchain-community>=0.3",
+    "chromadb>=0.5",
+    "pypdf>=4.0",
+    "python-docx>=1.1",
+    "numpy>=1.26",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+reranker = ["sentence-transformers>=3.0"]
+dev      = ["pytest>=8.0", "ruff>=0.4"]
+
+[project.scripts]
+adaptiverag = "adaptiverag.main:main"
+
+[project.urls]
+Repository = "https://github.com/navid72m/adaptiveRAG"
+
+[tool.setuptools.packages.find]
+where   = ["."]
+include = ["adaptiverag*"]

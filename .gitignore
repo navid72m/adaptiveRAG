@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# Project-specific runtime artifacts
+chroma_store/
+knowledge_base/
+validation_queries.json
+kb_manifest.json
+
+# IDE
+.vscode/
+.idea/
+*.vsix
+
+# OS
+.DS_Store
+Thumbs.db
