@@ -1,4 +1,4 @@
-# AdaptiveRAG — Agentic RAG Framework for Local LLMs
+# AdaptiveRAG — Agentic RAG Framework
 
 <p align="center">
   <img src="architecture.png" alt="AdaptiveRAG architecture diagram showing setup and query graphs" width="720"/>
@@ -8,14 +8,14 @@
   <a href="https://pypi.org/project/adaptiverag/"><img src="https://img.shields.io/pypi/v/adaptiverag?color=blue&label=PyPI" alt="PyPI version"/></a>
   <a href="https://pypi.org/project/adaptiverag/"><img src="https://img.shields.io/pypi/pyversions/adaptiverag" alt="Python versions"/></a>
   <a href="https://github.com/navid72m/adaptiveRAG/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license"/></a>
-  <a href="https://ollama.com"><img src="https://img.shields.io/badge/runs%20on-Ollama-black" alt="Runs on Ollama"/></a>
+  <a href="https://ollama.com"><img src="https://img.shields.io/badge/embeddings-Ollama-black" alt="Embeddings via Ollama"/></a>
+  <a href="https://www.anthropic.com"><img src="https://img.shields.io/badge/LLM-Claude-blueviolet" alt="Claude support"/></a>
+  <a href="https://openai.com"><img src="https://img.shields.io/badge/LLM-OpenAI-412991" alt="OpenAI support"/></a>
   <a href="https://pepy.tech/projects/adaptiverag"><img src="https://static.pepy.tech/personalized-badge/adaptiverag?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads" alt="PyPI Downloads"/></a>
 </p>
 
-
-
-> **Self-optimising, fully local Retrieval-Augmented Generation built with LangGraph.**
-> AdaptiveRAG analyses your knowledge base, auto-tunes the pipeline, and routes every query through the best retrieval strategy — all without sending data to any external API.
+> **Self-optimising Retrieval-Augmented Generation built with LangGraph.**
+> AdaptiveRAG analyses your knowledge base, auto-tunes the pipeline, and routes every query through the best retrieval strategy — works fully locally with Ollama or with Claude / OpenAI cloud APIs.
 
 ---
 
@@ -25,6 +25,7 @@
 - [How it works](#how-it-works)
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [LLM providers](#llm-providers)
 - [Configuration](#configuration)
 - [Supported document formats](#supported-document-formats)
 - [Validation queries](#validation-queries)
@@ -48,7 +49,7 @@ Most RAG pipelines execute the same fixed sequence regardless of what you ask. A
 | Result reranking | None | Cross-encoder reranking for analytical / comparison queries |
 | Answer quality | Not checked | Critic node scores the answer; retries with a new strategy if confidence is low |
 | Parameter tuning | Manual | Optimizer agent tunes chunk size, top-k, temperature, and reranking automatically |
-| Privacy | Requires external API | 100% local — no data leaves your machine |
+| LLM provider | Single hard-coded | Ollama (local), Claude, or OpenAI — swap with one parameter |
 
 ---
 
@@ -103,8 +104,20 @@ pip install adaptiverag
 pip install "adaptiverag[reranker]"
 ```
 
-> **Prerequisite:** [Ollama](https://ollama.com/download) must be running locally.
-> Any missing models are **pulled automatically** the first time `build_rag()` is called — no manual `ollama pull` required.
+**With Claude (Anthropic) support:**
+
+```bash
+pip install "adaptiverag[claude]"
+```
+
+**With OpenAI support:**
+
+```bash
+pip install "adaptiverag[openai]"
+```
+
+> **Prerequisite:** [Ollama](https://ollama.com/download) must be running locally — it is used for embeddings regardless of which LLM provider you choose.
+> Any missing Ollama models are **pulled automatically** the first time `build_rag()` is called.
 
 ---
 
@@ -146,14 +159,79 @@ Interactive prompt with the same agentic graph — type `trace` to see the last 
 
 ---
 
+## LLM providers
+
+AdaptiveRAG supports three LLM providers. **Embeddings always run locally via Ollama** regardless of which provider you pick.
+
+### Ollama (default — fully local)
+
+No API key needed. Any model from [ollama.com/library](https://ollama.com/library) works and is auto-pulled on first use.
+
+```python
+from adaptiverag import build_rag
+
+rag = build_rag(
+    llm_model   = "gemma4:latest",           # auto-pulled if not local
+    embed_model = "nomic-embed-text:latest",
+)
+```
+
+### Claude (Anthropic)
+
+Get an API key at [console.anthropic.com](https://console.anthropic.com). Install the extra first:
+
+```bash
+pip install "adaptiverag[claude]"
+```
+
+```python
+from adaptiverag import build_rag
+
+rag = build_rag(
+    api_key   = "sk-ant-...",          # defaults to claude-opus-4-7
+    # llm_model = "claude-sonnet-4-6" # override the model if needed
+)
+```
+
+### OpenAI
+
+Get an API key at [platform.openai.com](https://platform.openai.com/api-keys). Install the extra first:
+
+```bash
+pip install "adaptiverag[openai]"
+```
+
+```python
+from adaptiverag import build_rag
+
+rag = build_rag(
+    openai_api_key = "sk-...",    # defaults to gpt-4o
+    # llm_model    = "gpt-4-turbo" # override the model if needed
+)
+```
+
+### Provider comparison
+
+| | Ollama | Claude | OpenAI |
+|---|---|---|---|
+| Install extra | — | `adaptiverag[claude]` | `adaptiverag[openai]` |
+| Default model | `gemma4:latest` | `claude-opus-4-7` | `gpt-4o` |
+| Internet required | No | Yes | Yes |
+| Data leaves machine | No | Yes | Yes |
+| Cost | Free | Pay-per-token | Pay-per-token |
+
+---
+
 ## Configuration
 
 ```python
 rag = build_rag(
-    llm_model        = "gemma4:latest",              # any Ollama chat model (auto-pulled)
-    embed_model      = "nomic-embed-text:latest",    # any Ollama embedding model (auto-pulled)
+    llm_model        = "gemma4:latest",              # Ollama model (auto-pulled)
+    embed_model      = "nomic-embed-text:latest",    # Ollama embedding model (auto-pulled)
     kb_path          = "./knowledge_base",           # path to your documents
-    val_queries_path = "./validation_queries.json",  # optional — auto-generated from KB if omitted
+    val_queries_path = "./validation_queries.json",  # optional — auto-generated if omitted
+    api_key          = None,                         # Anthropic key → uses Claude
+    openai_api_key   = None,                         # OpenAI key → uses OpenAI
 )
 ```
 
@@ -169,9 +247,7 @@ result = rag.ask("Summarise the methodology", source_filter="report.pdf")
 
 ### Supported Ollama models
 
-Any model available at [ollama.com/library](https://ollama.com/library) works. Recommended:
-
-| Role | Model |
+| Role | Recommended models |
 |---|---|
 | LLM (routing + answers) | `gemma4`, `llama3.2`, `mistral`, `qwen2.5` |
 | Embeddings | `nomic-embed-text`, `mxbai-embed-large` |
@@ -221,10 +297,12 @@ Pass the path via `val_queries_path`. If you omit it:
 
 | Parameter | Type | Default | Description |
 |---|---|---|---|
-| `llm_model` | `str` | `"gemma4:latest"` | Ollama model for routing and answer generation |
-| `embed_model` | `str` | `"nomic-embed-text:latest"` | Ollama model for embeddings |
+| `llm_model` | `str` | `"gemma4:latest"` | Model for routing and answer generation |
+| `embed_model` | `str` | `"nomic-embed-text:latest"` | Ollama model for embeddings (always local) |
 | `kb_path` | `str \| None` | `"./knowledge_base"` | Folder containing your documents |
 | `val_queries_path` | `str \| None` | `"./validation_queries.json"` | Validation Q&A file (auto-generated if missing) |
+| `api_key` | `str \| None` | `None` | Anthropic API key — enables Claude as the LLM |
+| `openai_api_key` | `str \| None` | `None` | OpenAI API key — enables OpenAI as the LLM |
 
 ### `AdaptiveRAG.ask(question, source_filter=None) → QueryResult`
 
@@ -274,8 +352,8 @@ adaptiverag/
 ## Requirements
 
 - Python ≥ 3.10
-- [Ollama](https://ollama.com/download) running at `http://localhost:11434`
-- Dependencies installed automatically via pip: `langgraph`, `langchain-ollama`, `chromadb`, `pypdf`, `python-docx`, `numpy`, `tqdm`
+- [Ollama](https://ollama.com/download) running at `http://localhost:11434` (for embeddings)
+- Core dependencies installed automatically: `langgraph`, `langchain-ollama`, `chromadb`, `pypdf`, `python-docx`, `numpy`, `tqdm`
 
 ---
 
