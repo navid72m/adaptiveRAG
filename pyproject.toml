@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name        = "adaptiverag"
-version     = "1.0.1"
+version     = "1.0.2"
 description = "Agentic RAG Framework built with LangGraph and Ollama"
 readme      = "README.md"
 license = "MIT"
@@ -24,6 +24,8 @@ dependencies = [
 
 [project.optional-dependencies]
 reranker = ["sentence-transformers>=3.0"]
+claude   = ["langchain-anthropic>=0.3"]
+openai   = ["langchain-openai>=0.2"]
 dev      = ["pytest>=8.0", "ruff>=0.4"]
 
 [project.scripts]

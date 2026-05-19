@@ -1,12 +1,17 @@
 """
 Public Python API — used when importing adaptiverag as a library.
 
-Example
--------
+Example (Ollama)
+----------------
 >>> from adaptiverag import build_rag
 >>> rag = build_rag()
 >>> print(rag.ask("What is X?"))
->>> print(rag.ask("from:report.pdf Summarize the findings"))
+
+Example (Claude / Anthropic)
+-----------------------------
+>>> from adaptiverag import build_rag
+>>> rag = build_rag(api_key="sk-ant-...", llm_model="claude-opus-4-7")
+>>> print(rag.ask("What is X?"))
 """
 from __future__ import annotations
 
@@ -26,6 +31,9 @@ from .components.retriever import Retriever
 from .components.reranker import Reranker
 from .graphs.setup_graph import build_setup_graph
 from .graphs.query_graph import build_query_graph
+
+_CLAUDE_DEFAULT_MODEL  = "claude-opus-4-7"
+_OPENAI_DEFAULT_MODEL  = "gpt-4o"
 
 _OLLAMA_BASE = "http://localhost:11434"
 
@@ -153,11 +161,37 @@ class AdaptiveRAG:
         )
 
 
+def _build_claude_llm(model: str, api_key: str, temperature: float):
+    """Instantiate a ChatAnthropic LLM, raising a helpful error if the package is missing."""
+    try:
+        from langchain_anthropic import ChatAnthropic
+    except ImportError:
+        raise ImportError(
+            "langchain-anthropic is required to use the Claude provider.\n"
+            "Install it with:  pip install 'adaptiverag[claude]'"
+        )
+    return ChatAnthropic(model=model, api_key=api_key, temperature=temperature)
+
+
+def _build_openai_llm(model: str, api_key: str, temperature: float):
+    """Instantiate a ChatOpenAI LLM, raising a helpful error if the package is missing."""
+    try:
+        from langchain_openai import ChatOpenAI
+    except ImportError:
+        raise ImportError(
+            "langchain-openai is required to use the OpenAI provider.\n"
+            "Install it with:  pip install 'adaptiverag[openai]'"
+        )
+    return ChatOpenAI(model=model, api_key=api_key, temperature=temperature)
+
+
 def build_rag(
     llm_model:        str = LLM_MODEL,
     embed_model:      str = EMBED_MODEL,
     kb_path:          Optional[str] = None,
     val_queries_path: Optional[str] = None,
+    api_key:          Optional[str] = None,
+    openai_api_key:   Optional[str] = None,
 ) -> AdaptiveRAG:
     """
     Initialize the runtime, run the setup graph (index + optimise), and
@@ -166,26 +200,41 @@ def build_rag(
     Parameters
     ----------
     llm_model:
-        Ollama model tag for routing and answer generation.
-        Defaults to ``gemma4:latest``.  Must be pulled locally first::
+        Model name for the LLM used for routing and answer generation.
 
-            ollama pull gemma4
+        * **Ollama** (default): an Ollama model tag such as ``"gemma4:latest"``.
+          The model is pulled automatically if not already local.
+        * **Claude**: a Claude model ID such as ``"claude-opus-4-7"``.
+          Requires *api_key*.
+        * **OpenAI**: a model ID such as ``"gpt-4o"``.
+          Requires *openai_api_key*.
 
     embed_model:
-        Ollama model tag for embeddings.
-        Defaults to ``nomic-embed-text:latest``.  Must be pulled locally::
-
-            ollama pull nomic-embed-text
+        Ollama model tag for embeddings (always via Ollama).
+        Defaults to ``nomic-embed-text:latest``.
 
     kb_path:
-        Path to the knowledge-base folder.  Defaults to ``./knowledge_base``
-        in the current working directory.
+        Path to the knowledge-base folder.  Defaults to ``./knowledge_base``.
+
     val_queries_path:
-        Path to a JSON file containing validation queries used during
-        pipeline auto-tuning.  Each entry must be
-        ``{"query": "...", "expected_answer": "..."}``.
-        Defaults to ``./validation_queries.json``; auto-created if missing.
+        Path to a JSON file with validation queries for pipeline auto-tuning.
+        Each entry: ``{"query": "...", "expected_answer": "..."}``.
+        Defaults to ``./validation_queries.json``; auto-generated if missing.
+
+    api_key:
+        Anthropic API key (``sk-ant-...``).  When provided, the LLM defaults
+        to ``claude-opus-4-7`` and Ollama is used only for embeddings.
+
+    openai_api_key:
+        OpenAI API key (``sk-...``).  When provided, the LLM defaults to
+        ``gpt-4o`` and Ollama is used only for embeddings.
+        If both *api_key* and *openai_api_key* are given, Claude takes priority.
     """
+    if api_key and openai_api_key:
+        raise ValueError(
+            "Pass either api_key (Claude) or openai_api_key (OpenAI), not both."
+        )
+
     import adaptiverag.core.config as _cfg
 
     if kb_path:
@@ -194,16 +243,31 @@ def build_rag(
         _cfg.VAL_QUERIES_PATH = val_queries_path
     _cfg.EMBED_MODEL = embed_model
 
-    # Ensure Ollama is reachable, then pull any missing models automatically.
+    # Ollama is always needed for embeddings — check connectivity + pull embed model.
     available = _ollama_models()
-    _ensure_model(llm_model,   available)
     _ensure_model(embed_model, available)
 
-    RT.embedder   = Embedder(model=embed_model)
-    RT.retriever  = Retriever(RT.embedder)
-    RT.reranker   = Reranker()
-    RT.llm        = ChatOllama(model=llm_model, temperature=0.0)
-    RT.answer_llm = ChatOllama(model=llm_model, temperature=0.5)
+    RT.embedder  = Embedder(model=embed_model)
+    RT.retriever = Retriever(RT.embedder)
+    RT.reranker  = Reranker()
+
+    if api_key:
+        if llm_model == LLM_MODEL:
+            llm_model = _CLAUDE_DEFAULT_MODEL
+        RT.llm        = _build_claude_llm(llm_model, api_key, temperature=0.0)
+        RT.answer_llm = _build_claude_llm(llm_model, api_key, temperature=0.5)
+
+    elif openai_api_key:
+        if llm_model == LLM_MODEL:
+            llm_model = _OPENAI_DEFAULT_MODEL
+        RT.llm        = _build_openai_llm(llm_model, openai_api_key, temperature=0.0)
+        RT.answer_llm = _build_openai_llm(llm_model, openai_api_key, temperature=0.5)
+
+    else:
+        # Ollama provider — auto-pull LLM model too.
+        _ensure_model(llm_model, available)
+        RT.llm        = ChatOllama(model=llm_model, temperature=0.0)
+        RT.answer_llm = ChatOllama(model=llm_model, temperature=0.5)
 
     setup_graph = build_setup_graph()
     setup_graph.invoke(
