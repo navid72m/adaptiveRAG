@@ -9,8 +9,7 @@
   <a href="https://pypi.org/project/adaptiverag/"><img src="https://img.shields.io/pypi/pyversions/adaptiverag" alt="Python versions"/></a>
   <a href="https://github.com/navid72m/adaptiveRAG/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="MIT license"/></a>
   <a href="https://ollama.com"><img src="https://img.shields.io/badge/runs%20on-Ollama-black" alt="Runs on Ollama"/></a>
-
-  [![PyPI Downloads](https://static.pepy.tech/personalized-badge/adaptiverag?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/adaptiverag)
+  <a href="https://pepy.tech/projects/adaptiverag"><img src="https://static.pepy.tech/personalized-badge/adaptiverag?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads" alt="PyPI Downloads"/></a>
 </p>
 
 
