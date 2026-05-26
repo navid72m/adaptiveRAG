@@ -10,7 +10,8 @@ from langgraph.checkpoint.memory import MemorySaver
 from ..core.config import CONFIDENCE_THRESHOLD, RETRIEVAL_THRESHOLD, MAX_QUERY_RETRIES
 from ..core.runtime import RT
 from ..pipeline.tools import (
-    retrieve_documents, rerank_documents, expand_query_hyde, generate_answer,
+    retrieve_documents, rerank_documents, expand_query_hyde,
+    generate_answer, decompose_query, synthesize_answers,
 )
 
 
@@ -21,6 +22,8 @@ class QueryState(TypedDict, total=False):
     query_type:           str
     strategy:             Dict
     expansions:           List[str]
+    sub_queries:          List[str]
+    sub_answers:          List[Dict]
     retrieved_docs:       List[str]
     retrieval_confidence: float
     reranked_docs:        List[str]
@@ -69,6 +72,7 @@ KB Profile: {json.dumps(profile)}{retry_hint}
 Return ONLY JSON:
 {{
   "use_hyde": <true|false>,
+  "use_decompose": <true|false>,
   "use_multihop": <true|false>,
   "use_rerank": <true|false>,
   "top_k": <integer 3-15>,
@@ -76,10 +80,12 @@ Return ONLY JSON:
 }}
 
 Guidelines:
-- Factual short queries → minimal tools
+- Factual short queries → minimal tools, no decompose
+- Multi-part or compound questions (contains "and", "also", "as well as", multiple "?") → use_decompose
 - Analytical/comparison queries → use rerank, often multihop
 - Vague queries → use hyde to expand
-- Code queries → higher top_k, no rerank"""
+- Code queries → higher top_k, no rerank
+- use_decompose and use_hyde are mutually exclusive — pick one or neither"""
 
     try:
         resp     = RT.llm.invoke(prompt).content
@@ -95,6 +101,30 @@ Guidelines:
         }
 
     return {"strategy": strategy, "trace": [f"strategy: {strategy}"]}
+
+
+def node_decompose_query(state: QueryState) -> Dict:
+    if not state.get("strategy", {}).get("use_decompose"):
+        return {"sub_queries": [], "sub_answers": []}
+
+    sub_qs = decompose_query.invoke({"query": state["query"]})
+    if len(sub_qs) <= 1:
+        return {"sub_queries": [], "sub_answers": [],
+                "trace": ["decompose: query not complex enough, skipped"]}
+
+    src    = state.get("source_filter")
+    top_k  = max(state.get("strategy", {}).get("top_k", 5) // 2, 2)
+    pairs  = []
+    for q in sub_qs:
+        docs = retrieve_documents.invoke({"query": q, "top_k": top_k, "source_filter": src})
+        ans  = generate_answer.invoke({"query": q, "context": docs, "style": "factual"})
+        pairs.append({"question": q, "answer": ans})
+
+    return {
+        "sub_queries": sub_qs,
+        "sub_answers": pairs,
+        "trace": [f"decomposed into {len(sub_qs)} sub-questions: {sub_qs}"],
+    }
 
 
 def node_expand_query(state: QueryState) -> Dict:
@@ -184,6 +214,14 @@ def node_rerank(state: QueryState) -> Dict:
 
 
 def node_generate(state: QueryState) -> Dict:
+    sub_answers = state.get("sub_answers")
+    if sub_answers:
+        answer = synthesize_answers.invoke({
+            "original_query": state["query"],
+            "sub_answers":    sub_answers,
+        })
+        return {"answer": answer, "trace": [f"synthesized from {len(sub_answers)} sub-answers ({len(answer)} chars)"]}
+
     docs   = state.get("reranked_docs") or state.get("retrieved_docs", [])
     answer = generate_answer.invoke({
         "query":   state["query"],
@@ -268,6 +306,7 @@ def build_query_graph():
     g = StateGraph(QueryState)
     g.add_node("classify",         node_classify_query)
     g.add_node("strategize",       node_strategy_orchestrator)
+    g.add_node("decompose",        node_decompose_query)
     g.add_node("expand",           node_expand_query)
     g.add_node("retrieve",         node_retrieve)
     g.add_node("retrieval_critic", node_retrieval_critic)
@@ -279,7 +318,8 @@ def build_query_graph():
 
     g.add_edge(START,        "classify")
     g.add_edge("classify",   "strategize")
-    g.add_edge("strategize", "expand")
+    g.add_edge("strategize", "decompose")
+    g.add_edge("decompose",  "expand")
     g.add_edge("expand",     "retrieve")
     g.add_edge("retrieve",   "retrieval_critic")
 

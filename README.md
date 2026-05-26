@@ -26,6 +26,7 @@
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [LLM providers](#llm-providers)
+- [Multi-agent mode](#multi-agent-mode)
 - [Configuration](#configuration)
 - [Supported document formats](#supported-document-formats)
 - [Validation queries](#validation-queries)
@@ -114,6 +115,18 @@ pip install "adaptiverag[claude]"
 
 ```bash
 pip install "adaptiverag[openai]"
+```
+
+**With web search agent:**
+
+```bash
+pip install "adaptiverag[websearch]"
+```
+
+**Everything at once:**
+
+```bash
+pip install "adaptiverag[reranker,claude,openai,websearch]"
 ```
 
 > **Prerequisite:** [Ollama](https://ollama.com/download) must be running locally — it is used for embeddings regardless of which LLM provider you choose.
@@ -222,6 +235,86 @@ rag = build_rag(
 
 ---
 
+## Multi-agent mode
+
+AdaptiveRAG can operate as a **multi-agent system** where an LLM orchestrator dispatches each query to one or more specialised retrieval agents in parallel, merges their results, and synthesises a final answer.
+
+```
+Query
+  │
+  ▼
+Orchestrator Agent  ──── decides which agents to activate ────►
+  │                                                            │
+  ├── Vector Agent A  ──►  ChromaDB (your knowledge base)     │
+  ├── Web Agent B     ──►  DuckDuckGo web search              │
+  └── External Agent C ──► Slack / Gmail / custom source      │
+                                                               │
+  ◄──────────────────── merge + rerank + synthesise ──────────┘
+  │
+  ▼
+Response
+```
+
+### Enable web search
+
+```bash
+pip install "adaptiverag[websearch]"
+```
+
+```python
+from adaptiverag import build_rag
+
+rag = build_rag(enable_web_search=True)
+
+# The orchestrator will automatically add web search for queries about
+# current events or information unlikely to be in your documents.
+result = rag.ask("What are the latest developments in this field?")
+```
+
+### Add a custom agent (Slack, Gmail, Notion, …)
+
+Subclass `ExternalDataAgent` (or `BaseRetrievalAgent`) and pass it via `extra_agents`:
+
+```python
+from adaptiverag import build_rag
+from adaptiverag.agents import ExternalDataAgent
+
+class SlackAgent(ExternalDataAgent):
+    name        = "slack"
+    description = "Searches Slack messages and channels."
+
+    def retrieve(self, query, top_k=5, source_filter=None):
+        # call your Slack API here
+        return ["message snippet 1 ...", "message snippet 2 ..."]
+
+rag = build_rag(extra_agents=[SlackAgent()])
+result = rag.ask("Any Slack messages about the deployment issue?")
+```
+
+### Combine everything
+
+```python
+rag = build_rag(
+    api_key           = "sk-ant-...",   # Claude as the LLM
+    enable_web_search = True,           # DuckDuckGo agent
+    extra_agents      = [SlackAgent()], # your custom agent
+)
+```
+
+### How the orchestrator decides
+
+The routing LLM receives the query, its classified type, and a description of every available agent. It returns a list of agent names to activate — for example:
+
+| Query | Agents activated |
+|---|---|
+| "What does the spec say about X?" | `vector_search` |
+| "What happened with X last week?" | `vector_search`, `web_search` |
+| "Any emails about the X deadline?" | `vector_search`, `external_data` |
+
+On retry (low answer confidence), the orchestrator automatically broadens its agent selection.
+
+---
+
 ## Configuration
 
 ```python
@@ -303,6 +396,8 @@ Pass the path via `val_queries_path`. If you omit it:
 | `val_queries_path` | `str \| None` | `"./validation_queries.json"` | Validation Q&A file (auto-generated if missing) |
 | `api_key` | `str \| None` | `None` | Anthropic API key — enables Claude as the LLM |
 | `openai_api_key` | `str \| None` | `None` | OpenAI API key — enables OpenAI as the LLM |
+| `enable_web_search` | `bool` | `False` | Add DuckDuckGo web-search agent (requires `adaptiverag[websearch]`) |
+| `extra_agents` | `list \| None` | `None` | Additional `BaseRetrievalAgent` instances (Slack, Gmail, etc.) |
 
 ### `AdaptiveRAG.ask(question, source_filter=None) → QueryResult`
 
@@ -328,23 +423,29 @@ Pass the path via `val_queries_path`. If you omit it:
 ```
 adaptiverag/
 ├── core/
-│   ├── config.py        # constants and defaults
-│   ├── models.py        # KBProfile, PipelineConfig dataclasses
-│   └── runtime.py       # shared runtime singleton (RT)
+│   ├── config.py              # constants and defaults
+│   ├── models.py              # KBProfile, PipelineConfig dataclasses
+│   └── runtime.py             # shared runtime singleton (RT)
 ├── components/
-│   ├── chunker.py       # content-aware chunking strategies
-│   ├── embedder.py      # Ollama embedding wrapper
-│   ├── retriever.py     # ChromaDB retrieval
-│   └── reranker.py      # cross-encoder reranking (optional)
+│   ├── chunker.py             # content-aware chunking strategies
+│   ├── embedder.py            # Ollama embedding wrapper
+│   ├── retriever.py           # ChromaDB retrieval
+│   └── reranker.py            # cross-encoder reranking (optional)
 ├── pipeline/
-│   ├── tools.py         # LangChain tools (retrieve, rerank, HyDE, generate)
-│   ├── kb_analysis.py   # KB profiling and heuristic config planning
-│   └── file_loader.py   # document loading (.txt, .pdf, .md, .docx)
+│   ├── tools.py               # LangChain tools (retrieve, rerank, HyDE, decompose, synthesize)
+│   ├── kb_analysis.py         # KB profiling and heuristic config planning
+│   └── file_loader.py         # document loading (.txt, .pdf, .md, .docx)
+├── agents/
+│   ├── base.py                # BaseRetrievalAgent abstract class
+│   ├── vector_agent.py        # Agent A — ChromaDB vector search
+│   ├── web_agent.py           # Agent B — DuckDuckGo web search
+│   └── external_agent.py      # Agent C — pluggable stub (Slack, Gmail, …)
 ├── graphs/
-│   ├── setup_graph.py   # build-time LangGraph agent
-│   └── query_graph.py   # per-query LangGraph agent
-├── api.py               # public Python API (build_rag, AdaptiveRAG, QueryResult)
-└── main.py              # CLI entry point
+│   ├── setup_graph.py         # build-time LangGraph agent (index + optimise)
+│   ├── query_graph.py         # single-agent query graph (default)
+│   └── multi_agent_graph.py   # multi-agent orchestrator graph
+├── api.py                     # public Python API (build_rag, AdaptiveRAG, QueryResult)
+└── main.py                    # CLI entry point
 ```
 
 ---
@@ -353,7 +454,25 @@ adaptiverag/
 
 - Python ≥ 3.10
 - [Ollama](https://ollama.com/download) running at `http://localhost:11434` (for embeddings)
-- Core dependencies installed automatically: `langgraph`, `langchain-ollama`, `chromadb`, `pypdf`, `python-docx`, `numpy`, `tqdm`
+- Core dependencies (installed automatically via pip):
+
+```
+langgraph>=0.2          langchain-core>=0.3
+langchain-ollama>=0.2   langchain-community>=0.3
+chromadb>=0.5           pypdf>=4.0
+python-docx>=1.1        numpy>=1.26
+tqdm>=4.66
+```
+
+- Optional extras:
+
+| Extra | Installs | Enables |
+|---|---|---|
+| `adaptiverag[reranker]` | `sentence-transformers` | Cross-encoder reranking |
+| `adaptiverag[claude]` | `langchain-anthropic` | Claude LLM provider |
+| `adaptiverag[openai]` | `langchain-openai` | OpenAI LLM provider |
+| `adaptiverag[websearch]` | `duckduckgo-search` | Web search agent |
+| `adaptiverag[dev]` | `pytest`, `ruff` | Development tools |
 
 ---
 

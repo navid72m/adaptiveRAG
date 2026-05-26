@@ -31,6 +31,8 @@ from .components.retriever import Retriever
 from .components.reranker import Reranker
 from .graphs.setup_graph import build_setup_graph
 from .graphs.query_graph import build_query_graph
+from .graphs.multi_agent_graph import build_multi_agent_graph
+from .agents import VectorAgent, WebSearchAgent, ExternalDataAgent
 
 _CLAUDE_DEFAULT_MODEL  = "claude-opus-4-7"
 _OPENAI_DEFAULT_MODEL  = "gpt-4o"
@@ -121,8 +123,13 @@ class QueryResult:
 class AdaptiveRAG:
     """Ready-to-use RAG instance returned by :func:`build_rag`."""
 
-    def __init__(self):
-        self._query_graph = build_query_graph()
+    def __init__(self, multi_agent: bool = False):
+        if multi_agent:
+            self._graph       = build_multi_agent_graph()
+            self._multi_agent = True
+        else:
+            self._graph       = build_query_graph()
+            self._multi_agent = False
 
     def ask(self, question: str,
             source_filter: Optional[str] = None) -> QueryResult:
@@ -143,7 +150,7 @@ class AdaptiveRAG:
             if len(parts) == 2:
                 source_filter, q = parts[0][5:], parts[1]
 
-        result = self._query_graph.invoke(
+        result = self._graph.invoke(
             {
                 "query":         q,
                 "source_filter": source_filter,
@@ -152,11 +159,18 @@ class AdaptiveRAG:
             },
             config={"configurable": {"thread_id": f"query-{int(time.time())}"}},
         )
+
+        # strategy field exists in single-agent graph; active_agents in multi-agent
+        if self._multi_agent:
+            strategy_str = ", ".join(result.get("active_agents", []))
+        else:
+            strategy_str = result.get("strategy", {}).get("reason", "")
+
         return QueryResult(
             answer     = result.get("answer", ""),
             confidence = result.get("confidence", 0.0),
             retries    = result.get("retry_count", 0),
-            strategy   = result.get("strategy", {}).get("reason", ""),
+            strategy   = strategy_str,
             trace      = result.get("trace", []),
         )
 
@@ -186,12 +200,14 @@ def _build_openai_llm(model: str, api_key: str, temperature: float):
 
 
 def build_rag(
-    llm_model:        str = LLM_MODEL,
-    embed_model:      str = EMBED_MODEL,
-    kb_path:          Optional[str] = None,
-    val_queries_path: Optional[str] = None,
-    api_key:          Optional[str] = None,
-    openai_api_key:   Optional[str] = None,
+    llm_model:         str = LLM_MODEL,
+    embed_model:       str = EMBED_MODEL,
+    kb_path:           Optional[str] = None,
+    val_queries_path:  Optional[str] = None,
+    api_key:           Optional[str] = None,
+    openai_api_key:    Optional[str] = None,
+    enable_web_search: bool = False,
+    extra_agents:      Optional[List] = None,
 ) -> AdaptiveRAG:
     """
     Initialize the runtime, run the setup graph (index + optimise), and
@@ -200,35 +216,25 @@ def build_rag(
     Parameters
     ----------
     llm_model:
-        Model name for the LLM used for routing and answer generation.
-
-        * **Ollama** (default): an Ollama model tag such as ``"gemma4:latest"``.
-          The model is pulled automatically if not already local.
-        * **Claude**: a Claude model ID such as ``"claude-opus-4-7"``.
-          Requires *api_key*.
-        * **OpenAI**: a model ID such as ``"gpt-4o"``.
-          Requires *openai_api_key*.
-
+        Model for routing and answer generation.
+        Ollama (default), Claude (requires *api_key*), or OpenAI (requires *openai_api_key*).
     embed_model:
-        Ollama model tag for embeddings (always via Ollama).
-        Defaults to ``nomic-embed-text:latest``.
-
+        Ollama model tag for embeddings (always local). Default: ``nomic-embed-text:latest``.
     kb_path:
-        Path to the knowledge-base folder.  Defaults to ``./knowledge_base``.
-
+        Folder containing your documents. Default: ``./knowledge_base``.
     val_queries_path:
-        Path to a JSON file with validation queries for pipeline auto-tuning.
-        Each entry: ``{"query": "...", "expected_answer": "..."}``.
-        Defaults to ``./validation_queries.json``; auto-generated if missing.
-
+        JSON file with validation Q&A pairs. Auto-generated if missing.
     api_key:
-        Anthropic API key (``sk-ant-...``).  When provided, the LLM defaults
-        to ``claude-opus-4-7`` and Ollama is used only for embeddings.
-
+        Anthropic API key — enables Claude as the LLM.
     openai_api_key:
-        OpenAI API key (``sk-...``).  When provided, the LLM defaults to
-        ``gpt-4o`` and Ollama is used only for embeddings.
-        If both *api_key* and *openai_api_key* are given, Claude takes priority.
+        OpenAI API key — enables OpenAI as the LLM.
+    enable_web_search:
+        Add a web-search agent (DuckDuckGo) to the retrieval pool.
+        Requires ``pip install duckduckgo-search``.
+    extra_agents:
+        List of additional :class:`BaseRetrievalAgent` instances (e.g. Slack, Gmail).
+        When any agents are registered (including web search), the multi-agent
+        orchestrator graph is used automatically.
     """
     if api_key and openai_api_key:
         raise ValueError(
@@ -243,7 +249,6 @@ def build_rag(
         _cfg.VAL_QUERIES_PATH = val_queries_path
     _cfg.EMBED_MODEL = embed_model
 
-    # Ollama is always needed for embeddings — check connectivity + pull embed model.
     available = _ollama_models()
     _ensure_model(embed_model, available)
 
@@ -256,23 +261,40 @@ def build_rag(
             llm_model = _CLAUDE_DEFAULT_MODEL
         RT.llm        = _build_claude_llm(llm_model, api_key, temperature=0.0)
         RT.answer_llm = _build_claude_llm(llm_model, api_key, temperature=0.5)
-
     elif openai_api_key:
         if llm_model == LLM_MODEL:
             llm_model = _OPENAI_DEFAULT_MODEL
         RT.llm        = _build_openai_llm(llm_model, openai_api_key, temperature=0.0)
         RT.answer_llm = _build_openai_llm(llm_model, openai_api_key, temperature=0.5)
-
     else:
-        # Ollama provider — auto-pull LLM model too.
         _ensure_model(llm_model, available)
         RT.llm        = ChatOllama(model=llm_model, temperature=0.0)
         RT.answer_llm = ChatOllama(model=llm_model, temperature=0.5)
 
+    # ── Build agent pool ───────────────────────────────────────────────────
+    agents = [VectorAgent()]
+    if enable_web_search:
+        web = WebSearchAgent()
+        if web.is_available():
+            agents.append(web)
+        else:
+            print("  ⚠  Web search requested but 'duckduckgo-search' is not installed.")
+            print("       Run: pip install duckduckgo-search")
+    if extra_agents:
+        agents.extend(extra_agents)
+
+    RT.agents = agents
+    multi_agent = len(agents) > 1
+
+    if multi_agent:
+        agent_names = [a.name for a in agents]
+        print(f"\n[multi-agent] Active agents: {agent_names}")
+
+    # ── Setup graph (index + optimise) ────────────────────────────────────
     setup_graph = build_setup_graph()
     setup_graph.invoke(
         {"iteration": 0, "optimizer_log": [], "notes": []},
         config={"configurable": {"thread_id": "setup-1"}},
     )
 
-    return AdaptiveRAG()
+    return AdaptiveRAG(multi_agent=multi_agent)

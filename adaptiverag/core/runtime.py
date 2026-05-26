@@ -19,10 +19,12 @@ class Runtime:
     profile:    Optional[KBProfile]  = None
     config:     PipelineConfig       = None
     documents:  List[dict]           = None
+    agents:     List                 = None  # retrieval agents for multi-agent mode
 
     def __init__(self):
         self.config    = PipelineConfig()
         self.documents = []
+        self.agents    = []
 
 
 RT = Runtime()
